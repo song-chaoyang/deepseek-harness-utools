@@ -3,6 +3,9 @@ dsh-source/
 .codely-cli/
 mem-log/
 
+# Editor / tool config
+.atomcode/
+
 # OS
 .DS_Store
 Thumbs.db

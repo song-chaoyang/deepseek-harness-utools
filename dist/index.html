@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek Harness</title>
+  <link rel="stylesheet" href="css/main.css">
+  <link rel="stylesheet" href="css/loading.css">
+  <link rel="stylesheet" href="css/settings.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 加载视图 -->
+    <div id="view-loading" class="view active">
+      <div class="loading-container">
+        <div class="loading-spinner"></div>
+        <div class="loading-text" id="loading-text">正在初始化...</div>
+      </div>
+    </div>
+
+    <!-- 服务器管理视图 -->
+    <div id="view-server-manager" class="view">
+      <div class="server-manager">
+        <div class="sm-header">
+          <div class="sm-title">
+            <h1>DeepSeek Harness</h1>
+            <span class="sm-subtitle">Everything is a Plugin</span>
+          </div>
+          <div class="sm-status" id="server-status-badge">
+            <span class="status-dot status-unknown"></span>
+            <span class="status-text">检测中</span>
+          </div>
+        </div>
+
+        <!-- 环境检测面板 (仅在环境未通过时显示) -->
+
+        <div class="env-check-panel" id="env-check-panel" style="display:none">
+
+          <h2>环境检测</h2>
+
+          <div class="env-check-list" id="env-check-list">
+
+            <div class="env-check-item" data-check="nodejs">
+
+              <span class="env-check-icon">⏳</span>
+
+              <span class="env-check-name">Node.js 24.0+</span>
+
+              <span class="env-check-result"></span>
+
+              <div class="env-check-actions" id="env-actions-nodejs"></div>
+
+            </div>
+
+            <div class="env-check-item" data-check="npx">
+
+              <span class="env-check-icon">⏳</span>
+
+              <span class="env-check-name">npx / pnpm</span>
+
+              <span class="env-check-result"></span>
+
+              <div class="env-check-actions" id="env-actions-npx"></div>
+
+            </div>
+
+            <div class="env-check-item" data-check="dsh">
+
+              <span class="env-check-icon">⏳</span>
+
+              <span class="env-check-name">DSH 安装状态</span>
+
+              <span class="env-check-result"></span>
+
+              <div class="env-check-actions" id="env-actions-dsh"></div>
+
+            </div>
+
+          </div>
+
+          <div class="env-quick-actions" id="env-quick-actions"></div>
+
+        </div>
+
+
+        <!-- 主面板：工作区选择 + 服务器控制 -->
+
+        <div class="server-config-panel" id="server-config-panel" style="display:none">
+
+          <!-- 工作区选择 -->
+
+          <div class="form-row">
+
+            <label>工作区</label>
+
+            <div class="input-group">
+
+              <select id="config-workspace-select" style="flex:1"></select>
+
+              <button class="btn btn-secondary" id="btn-select-workspace">浏览...</button>
+
+            </div>
+
+          </div>
+
+
+          <!-- 服务器状态信息 (运行时显示) -->
+
+          <div id="server-info-section" style="display:none;margin-top:16px;padding:12px;background:var(--color-bg-secondary);border-radius:var(--radius-sm)">
+
+            <div class="info-grid">
+
+              <div class="info-item"><span class="info-label">状态</span><span class="info-value" id="info-status" style="color:var(--color-success)">运行中</span></div>
+
+              <div class="info-item"><span class="info-label">地址</span><span class="info-value" id="info-url">http://127.0.0.1:3080</span></div>
+
+              <div class="info-item"><span class="info-label">PID</span><span class="info-value" id="info-pid">-</span></div>
+
+              <div class="info-item"><span class="info-label">运行时间</span><span class="info-value" id="info-uptime">-</span></div>
+
+            </div>
+
+          </div>
+
+
+          <!-- 操作按钮 -->
+
+          <div class="server-actions" style="margin-top:16px">
+
+            <button class="btn btn-primary btn-large" id="btn-start-server">🚀 启动服务器</button>
+
+            <button class="btn btn-danger btn-large" id="btn-stop-server" style="display:none">⏹ 停止服务器</button>
+
+            <button class="btn btn-primary" id="btn-open-webui" style="display:none">🌐 打开 Web UI</button>
+
+            <button class="btn btn-secondary" id="btn-restart-server" style="display:none">🔄 重启</button>
+
+          </div>
+
+        </div>
+
+
+        <!-- 错误信息面板 -->
+
+        <div class="error-panel" id="error-panel" style="display:none">
+
+          <div class="error-icon">⚠️</div>
+
+          <h2 id="error-title">启动失败</h2>
+
+          <p id="error-message" class="error-message"></p>
+
+          <div class="error-suggestions" id="error-suggestions"></div>
+          <button class="btn btn-primary" id="btn-retry">重试</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Web UI iframe 容器视图 -->
+    <div id="view-web-ui" class="view">
+      <div class="web-ui-container">
+        <div class="web-ui-toolbar">
+          <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面">←</button>
+          <span class="web-ui-url" id="web-ui-url-display">http://127.0.0.1:3080</span>
+          <button class="btn btn-icon" id="btn-refresh-webui" title="刷新">↻</button>
+          <button class="btn btn-icon" id="btn-open-external" title="在浏览器中打开">↗</button>
+        </div>
+        <div class="web-ui-loading" id="web-ui-loading">
+          <div class="loading-spinner"></div>
+          <div class="loading-text">正在加载 DeepSeek Harness Web UI...</div>
+        </div>
+        <iframe id="dsh-iframe" class="dsh-iframe" style="display:none"></iframe>
+      </div>
+    </div>
+
+    <!-- Headless 任务运行器视图 -->
+    <div id="view-headless" class="view">
+      <div class="headless-runner">
+        <div class="hr-header">
+          <h1>Headless 任务</h1>
+          <span class="hr-subtitle">输入任务描述，DSH 将自动执行并返回结果</span>
+        </div>
+        <div class="hr-form">
+          <div class="form-row">
+            <label for="headless-task">任务描述</label>
+            <textarea id="headless-task" rows="4" placeholder="例如：分析当前项目的架构，列出主要模块及其职责"></textarea>
+          </div>
+          <div class="form-row">
+            <label for="headless-workspace">工作区</label>
+            <div class="input-group">
+              <input type="text" id="headless-workspace" placeholder="选择工作区路径" readonly>
+              <button class="btn btn-secondary" id="btn-headless-select-workspace">浏览</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <label for="headless-model">模型</label>
+            <select id="headless-model">
+              <option value="">默认</option>
+            </select>
+          </div>
+          <div class="hr-actions">
+            <button class="btn btn-primary btn-large" id="btn-run-headless">运行任务</button>
+            <button class="btn btn-secondary" id="btn-headless-clear" style="display:none">清空</button>
+          </div>
+        </div>
+        <div class="hr-output" id="hr-output" style="display:none">
+          <div class="hr-output-header">
+            <span class="hr-output-title">输出</span>
+            <div class="hr-output-actions">
+              <button class="btn btn-sm btn-secondary" id="btn-copy-result">复制结果</button>
+              <button class="btn btn-sm btn-secondary" id="btn-paste-result">粘贴到其他应用</button>
+              <button class="btn btn-sm btn-secondary" id="btn-open-in-webui">在 Web UI 中打开</button>
+            </div>
+          </div>
+          <div class="hr-output-content" id="hr-output-content"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 设置页面视图 -->
+    <div id="view-settings" class="view">
+      <div class="settings-page">
+        <div class="settings-tabs">
+          <button class="tab active" data-tab="models">模型配置</button>
+          <button class="tab" data-tab="workspace">工作区管理</button>
+          <button class="tab" data-tab="presets">Agent 预设</button>
+          <button class="tab" data-tab="skills">技能列表</button>
+          <button class="tab" data-tab="server">服务器配置</button>
+          <button class="tab" data-tab="env">环境检测</button>
+          <button class="tab" data-tab="advanced">高级配置</button>
+        </div>
+        <div class="settings-content">
+          <!-- 模型配置 Tab -->
+          <div class="tab-content active" data-tab="models">
+            <h2>模型配置</h2>
+            <div class="provider-card" id="provider-deepseek">
+              <div class="provider-header">
+                <h3>DeepSeek</h3>
+                <span class="provider-status">未配置</span>
+              </div>
+              <div class="provider-body">
+                <div class="form-row">
+                  <label for="deepseek-api-key">API Key</label>
+                  <input type="password" id="deepseek-api-key" placeholder="sk-...">
+                </div>
+                <button class="btn btn-primary btn-sm" id="btn-save-deepseek">保存</button>
+              </div>
+            </div>
+            <div class="provider-list" id="custom-provider-list">
+              <h3>已添加的 Provider</h3>
+              <div class="provider-empty">暂无自定义 Provider</div>
+            </div>
+            <button class="btn btn-secondary" id="btn-add-provider">+ 添加 Provider</button>
+          </div>
+
+          <!-- 工作区管理 Tab -->
+          <div class="tab-content" data-tab="workspace">
+            <h2>工作区管理</h2>
+            <h3>DSH 服务器工作区</h3>
+            <div class="workspace-list" id="dsh-workspace-list">
+              <div class="workspace-empty">正在加载...</div>
+            </div>
+            <button class="btn btn-secondary" id="btn-refresh-dsh-workspaces">刷新</button>
+            <h3>本地已保存工作区</h3>
+            <div class="workspace-list" id="workspace-list">
+              <div class="workspace-empty">暂无工作区，点击下方按钮添加</div>
+            </div>
+            <button class="btn btn-primary" id="btn-add-workspace">+ 添加工作区</button>
+          </div>
+
+          <!-- Agent 预设 Tab -->
+          <div class="tab-content" data-tab="presets">
+            <h2>Agent 预设</h2>
+            <div class="profile-list" id="agent-preset-list">
+              <div class="profile-empty">正在加载...</div>
+            </div>
+            <h3>预设操作</h3>
+            <div class="form-row">
+              <label for="preset-copy-from">复制预设</label>
+              <div class="input-group">
+                <input type="text" id="preset-copy-from" placeholder="源预设 ID">
+                <input type="text" id="preset-copy-to" placeholder="新预设 ID">
+                <button class="btn btn-secondary btn-sm" id="btn-copy-preset">复制</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 技能列表 Tab -->
+          <div class="tab-content" data-tab="skills">
+            <h2>技能列表</h2>
+            <div id="skill-list-container">
+              <div class="workspace-empty">正在加载...</div>
+            </div>
+            <button class="btn btn-secondary" id="btn-refresh-skills">刷新</button>
+          </div>
+
+          <!-- 服务器配置 Tab -->
+          <div class="tab-content" data-tab="server">
+            <h2>服务器配置</h2>
+            <div class="form-row">
+              <label for="setting-port">默认端口</label>
+              <input type="number" id="setting-port" value="3080" min="1024" max="65535">
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="setting-auto-start" checked>
+                <span>进入插件时自动启动服务器</span>
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="setting-background">
+                <span>允许服务器在后台运行（uTools 退出后继续）</span>
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="setting-auto-restart" checked>
+                <span>服务器崩溃后自动重启</span>
+              </label>
+            </div>
+            <button class="btn btn-primary" id="btn-save-server-settings">保存</button>
+          </div>
+
+          <!-- 环境检测 Tab -->
+          <div class="tab-content" data-tab="env">
+            <h2>环境检测</h2>
+            <div class="env-check-list" id="env-check-list-settings"></div>
+            <div class="env-actions">
+              <button class="btn btn-secondary" id="btn-recheck-env">重新检测</button>
+              <button class="btn btn-primary" id="btn-install-dsh">安装/更新 DSH</button>
+            </div>
+          </div>
+
+          <!-- 高级配置 Tab -->
+          <div class="tab-content" data-tab="advanced">
+            <h2>高级配置</h2>
+            <h3>Profile 管理</h3>
+            <div class="profile-list" id="profile-list">
+              <div class="profile-empty">正在加载...</div>
+            </div>
+            <h3>Cordis 配置树</h3>
+            <div class="form-row">
+              <label for="dump-profile">选择 Profile</label>
+              <select id="dump-profile">
+                <option value="web">web</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="dump-default-only">
+                <span>仅显示 bundle 层（不含用户层）</span>
+              </label>
+            </div>
+            <button class="btn btn-secondary" id="btn-dump-config">查看配置树</button>
+            <pre class="config-output" id="config-output" style="display:none"></pre>
+            <h3>遥测</h3>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="setting-telemetry-off">
+                <span>禁用遥测 (DSH_TELEMETRY_DISABLED)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 会话浏览器视图 -->
+    <div id="view-sessions" class="view">
+      <div class="session-browser">
+        <div class="sb-header">
+          <h1>会话历史</h1>
+          <div class="sb-search">
+            <input type="text" id="session-search" placeholder="搜索会话..." class="search-input">
+          </div>
+        </div>
+        <div class="sb-list" id="session-list">
+          <div class="loading-container">
+            <div class="loading-spinner"></div>
+            <div class="loading-text">加载会话列表...</div>
+          </div>
+        </div>
+        <div class="sb-detail" id="session-detail" style="display:none">
+          <div class="sb-detail-header">
+            <button class="btn btn-icon" id="btn-back-to-list">←</button>
+            <h2 id="session-detail-title">会话详情</h2>
+            <div class="sb-detail-actions">
+              <button class="btn btn-sm btn-primary" id="btn-resume-session">在 Web UI 中打开</button>
+              <button class="btn btn-sm btn-secondary" id="btn-fork-session">Fork</button>
+              <button class="btn btn-sm btn-secondary" id="btn-cancel-session">取消 Agent</button>
+              <button class="btn btn-sm btn-secondary" id="btn-screenshot-session">截图发送</button>
+              <button class="btn btn-sm btn-secondary" id="btn-export-session">导出</button>
+            </div>
+          </div>
+          <div class="sb-detail-content" id="session-detail-content"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 插件管理器视图 -->
+    <div id="view-plugin-mgr" class="view">
+      <div class="plugin-manager">
+        <div class="pm-header">
+          <h1>插件管理</h1>
+          <div class="pm-profile-select">
+            <label for="pm-profile">Profile:</label>
+            <select id="pm-profile">
+              <option value="web">web</option>
+            </select>
+          </div>
+        </div>
+        <div class="pm-actions">
+          <input type="text" id="pm-install-input" placeholder="包名，如 @scope/dsh-plugin-xxx">
+          <button class="btn btn-primary btn-sm" id="btn-install-plugin">安装</button>
+        </div>
+        <div class="pm-list" id="plugin-list">
+          <div class="loading-container">
+            <div class="loading-spinner"></div>
+            <div class="loading-text">加载插件列表...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/utils.js"></script>
+  <script src="js/server-manager.js"></script>
+  <script src="js/web-ui.js"></script>
+  <script src="js/headless-runner.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/session-browser.js"></script>
+  <script src="js/plugin-manager.js"></script>
+  <script src="js/goal-manager.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

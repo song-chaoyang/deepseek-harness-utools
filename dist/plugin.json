@@ -1,0 +1,36 @@
+{
+  "main": "index.html",
+  "logo": "logo.png",
+  "preload": "preload.js",
+  "development": {
+    "main": "index.html"
+  },
+  "features": [
+    {
+      "code": "dsh-main",
+      "explain": "DeepSeek Harness — AI Agent 工作台（启动服务器、打开 Web UI）",
+      "cmds": ["DeepSeek Harness", "dsh", "DSH", "deepseek harness", "AI Agent"]
+    },
+    {
+      "code": "dsh-sessions",
+      "explain": "浏览会话历史（搜索、Fork、取消、截图发送、导出）",
+      "cmds": ["dsh sessions", "DSH 会话", "dsh history"]
+    },
+    {
+      "code": "dsh-plugin-mgr",
+      "explain": "管理 DSH 插件（安装/卸载/搜索）",
+      "cmds": ["dsh plugins", "DSH 插件管理", "dsh plugin"]
+    },
+    {
+      "code": "dsh-workspace",
+      "explain": "选择工作区目录并在 DSH 中打开",
+      "cmds": ["dsh workspace", "DSH 工作区"],
+      "platform": ["win32", "darwin", "linux"]
+    },
+    {
+      "code": "dsh-goals",
+      "explain": "管理会话目标（创建/编辑/暂停/恢复/完成）",
+      "cmds": ["dsh goals", "DSH 目标", "dsh goal"]
+    }
+  ]
+}

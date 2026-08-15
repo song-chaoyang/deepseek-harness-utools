@@ -1,0 +1,16 @@
+﻿# Dependencies
+dsh-source/
+.codely-cli/
+mem-log/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp
+*.log
+*.tmp
+
+# Runtime (downloaded on first use, not committed)
+dist/runtime/

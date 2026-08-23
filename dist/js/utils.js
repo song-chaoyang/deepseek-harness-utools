@@ -3,6 +3,84 @@
  */
 
 const DshUtils = {
+  /** Global log entries buffer */
+  _logEntries: [],
+  _logMax: 500,
+  _logPanelOpen: false,
+
+  /**
+   * Append a log entry. Visible in the global log panel.
+   * @param {string} text
+   * @param {string} [level] - 'info' | 'error' | 'warn'
+   */
+  log(text, level = 'info') {
+    const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+    const entry = { ts, text, level }
+    this._logEntries.push(entry)
+    if (this._logEntries.length > this._logMax) this._logEntries.shift()
+
+    // If log panel is open, append directly
+    if (this._logPanelOpen) {
+      this._appendLogToPanel(entry)
+    }
+  },
+
+  /**
+   * Append one entry to the log panel DOM.
+   */
+  _appendLogToPanel(entry) {
+    const logEl = document.getElementById('log-content')
+    if (!logEl) return
+    const cls = entry.level === 'error' ? 'log-error' : entry.level === 'warn' ? 'log-warn' : ''
+    const escaped = this.escapeHtml(entry.text)
+    const colored = escaped
+      .replace(/(error|Error|ERROR)/g, '<span class="log-error">$1</span>')
+      .replace(/(warn|Warn|WARN)/g, '<span class="log-warn">$1</span>')
+    logEl.innerHTML += `<span class="log-ts">[${entry.ts}]</span> ${colored}\n`
+    // Cap DOM size
+    if (logEl.innerHTML.length > 50000) {
+      logEl.innerHTML = logEl.innerHTML.slice(-50000)
+    }
+    logEl.scrollTop = logEl.scrollHeight
+  },
+
+  /**
+   * Render all buffered logs into the panel (called on open).
+   */
+  _renderAllLogs() {
+    const logEl = document.getElementById('log-content')
+    if (!logEl) return
+    logEl.innerHTML = ''
+    for (const entry of this._logEntries) {
+      this._appendLogToPanel(entry)
+    }
+  },
+
+  /**
+   * Toggle the global log panel.
+   */
+  toggleLogPanel() {
+    const panel = document.getElementById('log-panel')
+    if (!panel) return
+    if (panel.style.display === 'flex') {
+      this._logPanelOpen = false
+      panel.style.display = 'none'
+    } else {
+      this._logPanelOpen = true
+      this._renderAllLogs()
+      panel.style.display = 'flex'
+    }
+  },
+
+  /**
+   * Clear the log panel and buffer.
+   */
+  clearLogs() {
+    this._logEntries = []
+    const logEl = document.getElementById('log-content')
+    if (logEl) logEl.innerHTML = ''
+  },
+
   /**
    * Show a view by ID, hiding all others.
    * @param {string} viewId

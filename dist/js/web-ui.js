@@ -15,6 +15,12 @@ const WebUI = {
   /** Load timeout timer */
   loadTimeout: null,
 
+  /** Log panel polling timer */
+  logTimer: null,
+
+  /** Log panel cursor */
+  logCursor: 0,
+
   /**
    * Open the Web UI view.
    */
@@ -179,6 +185,61 @@ const WebUI = {
   },
 
   /**
+   * Toggle the log panel visibility (delegates to global DshUtils).
+   */
+  toggleLogs() {
+    DshUtils.toggleLogPanel()
+    // If opening and server is running, start polling server stdout/stderr
+    const panel = document.getElementById('log-panel')
+    if (panel && panel.style.display === 'flex') {
+      this.startLogPolling()
+    } else {
+      this.stopLogPolling()
+    }
+  },
+
+  /**
+   * Start polling server stdout/stderr into the global log.
+   */
+  startLogPolling() {
+    this.stopLogPolling()
+    this.logTimer = setInterval(() => this.pollServerLogs(), 1000)
+  },
+
+  /**
+   * Stop polling logs.
+   */
+  stopLogPolling() {
+    if (this.logTimer) {
+      clearInterval(this.logTimer)
+      this.logTimer = null
+    }
+  },
+
+  /**
+   * Poll server stdout/stderr and append to global log buffer.
+   */
+  pollServerLogs() {
+    let text = ''
+    try {
+      text = (window.dsh.server.getStdout(200) || '') + (window.dsh.server.getStderr(200) || '')
+    } catch { return }
+    const fresh = text.slice(this.logCursor)
+    if (fresh) {
+      this.logCursor = text.length
+      const level = /error|Error|ERROR/i.test(fresh) ? 'error' : /warn|Warn|WARN/i.test(fresh) ? 'warn' : 'info'
+      DshUtils.log(fresh.trimEnd(), level)
+    }
+  },
+
+  /**
+   * Clear the log panel (delegates to global DshUtils).
+   */
+  clearLogs() {
+    DshUtils.clearLogs()
+  },
+
+  /**
    * Initialize event listeners.
    */
   init() {
@@ -201,6 +262,30 @@ const WebUI = {
     const btnExternal = document.getElementById('btn-open-external')
     if (btnExternal) {
       btnExternal.addEventListener('click', () => this.openExternal())
+    }
+
+    const btnLogs = document.getElementById('btn-show-logs')
+    if (btnLogs) {
+      btnLogs.addEventListener('click', () => this.toggleLogs())
+    }
+
+    const btnCloseLogs = document.getElementById('btn-close-logs')
+    if (btnCloseLogs) {
+      btnCloseLogs.addEventListener('click', () => this.toggleLogs())
+    }
+
+    const btnClearLogs = document.getElementById('btn-clear-logs')
+    if (btnClearLogs) {
+      btnClearLogs.addEventListener('click', () => this.clearLogs())
+    }
+
+    const btnMarket = document.getElementById('btn-dsh-market-webui')
+    if (btnMarket) {
+      btnMarket.addEventListener('click', () => {
+        if (typeof utools !== 'undefined' && utools.shellOpenExternal) {
+          utools.shellOpenExternal('https://dsh-market.com/')
+        }
+      })
     }
   },
 }

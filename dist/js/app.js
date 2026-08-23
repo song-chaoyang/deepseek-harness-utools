@@ -145,18 +145,13 @@ const App = {
    * Workspace selector view.
    */
   async showWorkspace(action) {
+    // Workspace selection is handled by DSH Web UI itself.
+    // If a folder is dropped, set it as cwd for the server process.
     if (action.type === 'file' && action.payload) {
       const files = Array.isArray(action.payload) ? action.payload : [action.payload]
       const dir = files.find((f) => f.isDirectory)
       if (dir) {
-        window.dsh.workspace.add(dir.path)
         window.dsh.workspace.setCurrent(dir.path)
-        DshUtils.showView('view-server-manager')
-        this.setExpendHeight(600)
-        await ServerManager.checkEnvironment()
-        const port = this.getSetting('port', 3080)
-        await ServerManager.startServer({ workspace: dir.path, port, profile: 'web' })
-        return
       }
     }
 

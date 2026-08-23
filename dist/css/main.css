@@ -892,3 +892,142 @@ body {
   margin-bottom: 8px;
   font-size: 13px;
 }
+
+/* ===== uTools AI Model List ===== */
+.utools-ai-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.utools-ai-model-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.utools-ai-model-item:last-child {
+  border-bottom: none;
+}
+
+.utools-ai-model-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.utools-ai-model-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.utools-ai-model-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.utools-ai-model-desc {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.utools-ai-model-cost {
+  font-size: 11px;
+  color: var(--color-warning);
+  flex-shrink: 0;
+}
+
+/* ===== Log Panel ===== */
+.log-panel {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 240px;
+  background: var(--color-bg);
+  border-top: 2px solid var(--color-primary);
+  display: none;
+  flex-direction: column;
+  z-index: 1000;
+  box-shadow: 0 -4px 12px rgba(0,0,0,0.1);
+}
+
+.log-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.log-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.log-panel-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.log-panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+.log-panel-content .log-error {
+  color: var(--color-danger);
+}
+
+.log-panel-content .log-warn {
+  color: var(--color-warning);
+}
+
+.log-panel-content .log-ts {
+  color: var(--color-text-secondary);
+  opacity: 0.6;
+}
+
+/* ===== Quick Command Templates ===== */
+.template-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.template-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.template-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}

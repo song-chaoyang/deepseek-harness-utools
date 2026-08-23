@@ -44,6 +44,9 @@ let serverStatus = {
 let stdoutBuffer = []
 let stderrBuffer = []
 
+// Cached node resolution (avoid repeated execSync calls that block the event loop)
+let _cachedNodeInfo = null
+
 // ============================================================
 //  Utilities
 // ============================================================
@@ -58,19 +61,11 @@ function getDshHome() {
 
 /**
  * Get the plugin's runtime data directory.
- * Bundled Node.js ships in the plugin's own `runtime/node/` folder;
- * downloaded runtimes go to uTools userData/runtime/node.
+ * Node.js is downloaded on first launch to uTools userData/runtime.
  * @returns {string}
  */
 function getRuntimeDir() {
-  // 1. Bundled Node.js in the plugin directory itself (shipped in the package)
-  const pluginDir = __dirname
-  const bundledDir = path.join(pluginDir, 'runtime')
-  if (fs.existsSync(path.join(bundledDir, 'node', 'node.exe')) ||
-      fs.existsSync(path.join(bundledDir, 'node', 'bin', 'node'))) {
-    return bundledDir
-  }
-  // 2. Downloaded Node.js in uTools userData
+  // Downloaded Node.js in uTools userData
   if (typeof utools !== 'undefined' && utools.getPath) {
     try {
       return path.join(utools.getPath('userData'), 'runtime')
@@ -115,6 +110,9 @@ function getBundledPaths() {
  * @returns {{ path: string|null, version: string|null, source: 'bundled'|'system'|null }}
  */
 function resolveNode() {
+  // Return cached result to avoid repeated execSync calls
+  if (_cachedNodeInfo !== null) return _cachedNodeInfo
+
   // 1. Bundled
   const bundled = getBundledNodePath()
   if (bundled) {
@@ -122,7 +120,8 @@ function resolveNode() {
       const out = execSync(`"${bundled}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
       const ver = out.trim()
       if (versionGte(ver, '24.0.0')) {
-        return { path: bundled, version: ver, source: 'bundled' }
+        _cachedNodeInfo = { path: bundled, version: ver, source: 'bundled' }
+        return _cachedNodeInfo
       }
     } catch { /* broken, fall through */ }
   }
@@ -133,11 +132,14 @@ function resolveNode() {
     if (versionGte(ver, '24.0.0')) {
       const which = process.platform === 'win32' ? 'where' : 'which'
       const resolved = execSync(`${which} node`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split('\n')[0].trim()
-      return { path: resolved, version: ver, source: 'system' }
+      _cachedNodeInfo = { path: resolved, version: ver, source: 'system' }
+      return _cachedNodeInfo
     }
-    return { path: null, version: ver, source: null }
+    _cachedNodeInfo = { path: null, version: ver, source: null }
+    return _cachedNodeInfo
   } catch {
-    return { path: null, version: null, source: null }
+    _cachedNodeInfo = { path: null, version: null, source: null }
+    return _cachedNodeInfo
   }
 }
 
@@ -150,12 +152,24 @@ function resolveNode() {
 function resolveNpx() {
   const bundled = getBundledPaths()
   if (bundled.node) {
-    // Use bundled node.exe directly to run npx-cli.js (avoids .cmd shell issues)
-    const npxCli = path.join(path.dirname(bundled.node), 'node_modules', 'npm', 'bin', 'npx-cli.js')
-    if (fs.existsSync(npxCli)) {
-      return { cmd: bundled.node, preArgs: [npxCli], shell: false }
+    // Use bundled node directly to run npx-cli.js (avoids .cmd shell issues)
+    // On Windows: node.exe is at <runtime>/node/node.exe, npx-cli.js is at
+    //   <runtime>/node/node_modules/npm/bin/npx-cli.js
+    // On macOS/Linux: node is at <runtime>/node/bin/node, npx-cli.js is at
+    //   <runtime>/node/lib/node_modules/npm/bin/npx-cli.js
+    const nodeDir = path.dirname(bundled.node)   // '.../node' on Win, '.../node/bin' on Unix
+    const parentDir = path.dirname(nodeDir)       // '.../node' on both
+    // Try Windows layout first
+    const npxCliWin = path.join(parentDir, 'node_modules', 'npm', 'bin', 'npx-cli.js')
+    if (fs.existsSync(npxCliWin)) {
+      return { cmd: bundled.node, preArgs: [npxCliWin], shell: false }
     }
-    // Fallback: npx.cmd path (requires shell:true)
+    // Try macOS/Linux layout
+    const npxCliUnix = path.join(parentDir, 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js')
+    if (fs.existsSync(npxCliUnix)) {
+      return { cmd: bundled.node, preArgs: [npxCliUnix], shell: false }
+    }
+    // Fallback: npx.cmd / bin/npx path (requires shell:true)
     if (bundled.npx) {
       return { cmd: bundled.npx, preArgs: [], shell: true }
     }
@@ -180,6 +194,29 @@ function resolveNpm() {
     return process.platform === 'win32' ? 'npm.cmd' : 'npm'
   }
   return null
+}
+
+/**
+ * Resolve the globally-installed DSH CLI entry (npm global install).
+ * Returns the absolute path to `@deepseek-ai/dsh/lib/bin.js`, or null when
+ * DSH is not installed globally. Using this directly avoids the slow
+ * npx registry round-trip on every server start.
+ * @returns {string|null}
+ */
+function resolveGlobalDshBin() {
+  const nodeInfo = resolveNode()
+  if (!nodeInfo.path) return null
+  try {
+    const pathSep = process.platform === 'win32' ? ';' : ':'
+    const systemPath = process.env.PATH || process.env.Path || ''
+    const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
+    const out = execSync('npm root -g', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
+    if (!out) return null
+    const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    return fs.existsSync(bin) ? bin : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -294,7 +331,6 @@ async function downloadNodeRuntime(callbacks = {}) {
   const ext = process.platform === 'win32' ? 'zip' : 'tar.gz'
   const version = 'v24.11.0'
   const filename = `node-${version}-${platform}-${arch}.${ext}`
-  const url = `https://nodejs.org/dist/${version}/${filename}`
   const archivePath = path.join(archiveDir, filename)
 
   // Check if already extracted
@@ -307,14 +343,36 @@ async function downloadNodeRuntime(callbacks = {}) {
     } catch { /* re-download */ }
   }
 
-  // Download
-  onProgress(`正在下载 Node.js ${version} (${platform}-${arch})...`)
-  try {
-    await downloadFile(url, archivePath, (recv, tot) => {
-      if (tot > 0) onProgress(`下载中... ${Math.round((recv / tot) * 100)}%`)
-    })
-  } catch (err) {
-    return { success: false, path: '', error: `下载失败: ${err.message}` }
+  // Mirror list — official first, China mirrors as fallback for domestic users
+  const mirrors = [
+    `https://nodejs.org/dist/${version}/${filename}`,
+    `https://npmmirror.com/mirrors/node/${version}/${filename}`,
+    `https://registry.npmmirror.com/-/binary/node/${version}/${filename}`,
+    `https://cdn.npmmirror.com/binaries/node/${version}/${filename}`,
+  ]
+
+  // Download with mirror fallback
+  let downloadOk = false
+  let lastError = null
+  for (let i = 0; i < mirrors.length; i++) {
+    const url = mirrors[i]
+    onProgress(`正在下载 Node.js ${version} (${platform}-${arch}) [镜像 ${i + 1}/${mirrors.length}]...`)
+    try {
+      await downloadFile(url, archivePath, (recv, tot) => {
+        if (tot > 0) onProgress(`下载中... ${Math.round((recv / tot) * 100)}%`)
+      })
+      downloadOk = true
+      break
+    } catch (err) {
+      lastError = err
+      // Clean up partial download
+      try { fs.unlinkSync(archivePath) } catch { /* ignore */ }
+      onProgress(`镜像 ${i + 1} 失败，尝试下一个...`)
+    }
+  }
+
+  if (!downloadOk) {
+    return { success: false, path: '', error: `所有下载镜像均失败: ${lastError?.message || '未知错误'}。\n请检查网络连接，或手动从 https://nodejs.org 下载。` }
   }
 
   // Extract
@@ -332,10 +390,19 @@ async function downloadNodeRuntime(callbacks = {}) {
   if (entries.length === 1) {
     const subDir = path.join(nodeDir, entries[0])
     if (fs.statSync(subDir).isDirectory()) {
-      for (const item of fs.readdirSync(subDir)) {
-        fs.renameSync(path.join(subDir, item), path.join(nodeDir, item))
+      // Try rename first (fast, same-filesystem); fall back to copy (cross-device)
+      try {
+        for (const item of fs.readdirSync(subDir)) {
+          fs.renameSync(path.join(subDir, item), path.join(nodeDir, item))
+        }
+        fs.rmdirSync(subDir)
+      } catch {
+        // Cross-device: use recursive copy + delete
+        for (const item of fs.readdirSync(subDir)) {
+          fs.cpSync(path.join(subDir, item), path.join(nodeDir, item), { recursive: true })
+        }
+        fs.rmSync(subDir, { recursive: true, force: true })
       }
-      fs.rmdirSync(subDir)
     }
   }
 
@@ -573,33 +640,51 @@ window.dsh.env = {
   },
 
   /**
-   * Check if DSH is installed (globally or via npx cache).
-   * Uses bundled or system npx.
+   * Check if DSH is installed globally (fast, non-blocking-safe).
+   * Only checks `dsh --version` — the slow npx fallback is intentionally
+   * omitted to avoid blocking the UI thread with execSync for 30 seconds.
    * @returns {{ installed: boolean, version: string|null, method: string|null }}
    */
   hasDshInstalled() {
-    const npxInfo = resolveNpx()
     const nodeInfo = resolveNode()
+    const pathSep = process.platform === 'win32' ? ';' : ':'
+    const systemPath = process.env.PATH || process.env.Path || ''
+    const env = nodeInfo.path
+      ? { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
+      : { ...process.env }
 
-    // Check global install
+    // Check global install only (fast, 5s timeout)
     try {
-      const out = execSync('dsh --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
+      const out = execSync('dsh --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000, env })
       return { installed: true, version: out.trim(), method: 'global' }
     } catch { /* not global */ }
 
-    // Check via npx
-    if (npxInfo && nodeInfo.path) {
-      try {
-        const npxArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'].join(' ')
-        const out = execSync(`"${npxInfo.cmd}" ${npxArgs}`, {
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'ignore'],
-          timeout: 30000,
-          env: { ...process.env, PATH: path.dirname(nodeInfo.path) + (process.platform === 'win32' ? ';' : ':') + (process.env.PATH || '') },
+    return { installed: false, version: null, method: null }
+  },
+
+  /**
+   * Async DSH check via npx (non-blocking). Used by checkEnvironment
+   * to avoid freezing the UI with execSync.
+   * @returns {Promise<{ installed: boolean, version: string|null, method: string|null }>}
+   */
+  async hasDshInstalledAsync() {
+    const nodeInfo = resolveNode()
+    const pathSep = process.platform === 'win32' ? ';' : ':'
+    const systemPath = process.env.PATH || process.env.Path || ''
+    const env = nodeInfo.path
+      ? { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
+      : { ...process.env }
+
+    // Fast: check global dsh
+    try {
+      const out = await new Promise((resolve, reject) => {
+        exec('dsh --version', { encoding: 'utf8', timeout: 5000, env }, (err, stdout) => {
+          if (err) reject(err)
+          else resolve(stdout)
         })
-        return { installed: true, version: out.trim(), method: 'npx' }
-      } catch { /* npx failed */ }
-    }
+      })
+      return { installed: true, version: out.trim(), method: 'global' }
+    } catch { /* not global */ }
 
     return { installed: false, version: null, method: null }
   },
@@ -713,27 +798,33 @@ window.dsh.server = {
     // Yield before synchronous execSync calls to let UI render
     await new Promise(r => setTimeout(r, 0))
 
-    // Determine the command to run — use bundled or system npx
+    // Determine the command to run — prefer the globally-installed DSH CLI
+    // (fast: no npx registry round-trip), falling back to npx when missing.
+    const globalDshBin = resolveGlobalDshBin()
     const npxInfo = resolveNpx()
     const nodeInfo = resolveNode()
 
     // Debug: log resolved paths to console for troubleshooting
+    console.log('[dsh] resolveGlobalDshBin:', globalDshBin)
     console.log('[dsh] resolveNpx:', JSON.stringify(npxInfo))
     console.log('[dsh] resolveNode:', JSON.stringify(nodeInfo))
 
-    if (!npxInfo || !nodeInfo.path) {
+    if (!globalDshBin && (!npxInfo || !nodeInfo.path)) {
       // Last resort: try system npx directly
       return {
         success: false,
         url: '',
-        error: `Node.js 或 npx 不可用。npxInfo=${JSON.stringify(npxInfo)}, nodeInfo=${JSON.stringify(nodeInfo)}`,
+        error: `Node.js 或 npx 不可用。globalDshBin=${globalDshBin}, npxInfo=${JSON.stringify(npxInfo)}, nodeInfo=${JSON.stringify(nodeInfo)}`,
       }
     }
 
     // Build command arguments
-    const cmdArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh']
+    const cmdArgs = globalDshBin ? [globalDshBin] : [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh']
     if (profile === 'web') {
       cmdArgs.push('web')
+      // DSH `web` command opens the default browser by default; we serve the
+      // UI inside the uTools iframe instead, so suppress the external browser.
+      cmdArgs.push('--no-open')
     } else {
       cmdArgs.push('--profile', profile)
     }
@@ -749,6 +840,10 @@ window.dsh.server = {
     // Environment variables — prepend bundled node dir to PATH
     const env = { ...process.env }
     env.DSH_HOME = getDshHome()
+    // Use China-friendly registry by default (user can override via .npmrc)
+    if (!env.npm_config_registry) {
+      env.npm_config_registry = 'https://registry.npmmirror.com'
+    }
     const nodeDir = path.dirname(nodeInfo.path)
     const pathSep = process.platform === 'win32' ? ';' : ':'
     // Ensure PATH includes system paths + bundled node
@@ -760,12 +855,21 @@ window.dsh.server = {
     }
 
     try {
-      dshProcess = spawn(npxInfo.cmd, cmdArgs, {
-        cwd: workspace || process.cwd(),
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        shell: npxInfo.shell,
-      })
+      // With a global DSH, spawn the bundled node directly on the DSH entry
+      // (shell:false); otherwise spawn npx as before.
+      dshProcess = globalDshBin
+        ? spawn(nodeInfo.path, cmdArgs, {
+            cwd: workspace || process.cwd(),
+            env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: false,
+          })
+        : spawn(npxInfo.cmd, cmdArgs, {
+            cwd: workspace || process.cwd(),
+            env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: npxInfo.shell,
+          })
     } catch (err) {
       return { success: false, url: '', error: `Failed to spawn process: ${err.message}` }
     }
@@ -825,6 +929,17 @@ window.dsh.server = {
       const combined = stderr + stdout
       if (combined.includes('EADDRINUSE')) {
         errorMsg = `端口 ${port} 被占用。可能是之前的 DSH 服务器未正常关闭。\n请点击"重启"按钮重试，或关闭占用该端口的程序后重试。`
+      }
+      if (combined.includes('EACCES')) {
+        const isWin = process.platform === 'win32'
+        errorMsg = `端口 ${port} 访问被拒绝 (EACCES)。可能原因：\n` +
+          (isWin
+            ? `1. 防火墙拦截了 Node.js — 请检查 Windows 防火墙设置\n`
+            : `1. 端口需要更高权限 — Unix 系统下 1024 以下端口需要 root\n`) +
+          `2. 端口被系统保留 — 请尝试在设置中更换端口 (如 3081, 3180)\n` +
+          (isWin
+            ? `3. 权限不足 — 请尝试以管理员身份运行 uTools`
+            : `3. 权限不足 — 请尝试在终端运行: sudo uTools 或更换端口`)
       }
       return {
         success: false,
@@ -1115,11 +1230,12 @@ window.dsh.config = {
       }
 
       const pathSep = process.platform === 'win32' ? ';' : ':'
+      const systemPath = process.env.PATH || process.env.Path || ''
       exec(`"${npxInfo.cmd}" ${args.join(' ')}`, {
         encoding: 'utf8',
         timeout: 30000,
         cwd: process.cwd(),
-        env: { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + (process.env.PATH || '') },
+        env: { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath },
       }, (err, stdout, stderr) => {
         if (err) {
           reject(new Error(stderr || err.message))
@@ -1241,17 +1357,46 @@ window.dsh.cli = {
     } = options
 
     return new Promise((resolve) => {
+      const globalDshBin = resolveGlobalDshBin()
       const npxInfo = resolveNpx()
-      const args = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--profile', 'headless', task]
+      const nodeInfo = resolveNode()
+
+      if (!globalDshBin && (!npxInfo || !nodeInfo.path)) {
+        resolve({ success: false, output: '', error: 'Node.js 或 npx 不可用' })
+        return
+      }
+
+      // Build command — prefer global DSH for speed (no npx round-trip)
+      let cmd, cmdArgs, useShell
+      const env = { ...process.env }
+      if (nodeInfo.path) {
+        const nodeDir = path.dirname(nodeInfo.path)
+        const pathSep = process.platform === 'win32' ? ';' : ':'
+        env.PATH = nodeDir + pathSep + (process.env.PATH || process.env.Path || '')
+      }
+      if (!env.npm_config_registry) {
+        env.npm_config_registry = 'https://registry.npmmirror.com'
+      }
+      if (model) env.DSH_MODEL = model
+
+      if (globalDshBin) {
+        cmd = nodeInfo.path
+        cmdArgs = [globalDshBin, '--profile', 'headless', task]
+        useShell = false
+      } else {
+        cmd = npxInfo.cmd
+        cmdArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--profile', 'headless', task]
+        useShell = npxInfo.shell
+      }
 
       let output = ''
       let errorOutput = ''
 
-      const child = spawn(npxInfo.cmd, args, {
+      const child = spawn(cmd, cmdArgs, {
         cwd: workspace,
-        env: { ...process.env, ...(model ? { DSH_MODEL: model } : {}) },
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
-        shell: npxInfo.shell,
+        shell: useShell,
       })
 
       child.stdout.on('data', (data) => {
@@ -1293,17 +1438,44 @@ window.dsh.cli = {
    */
   async runPlugin(profile, args, callbacks = {}) {
     return new Promise((resolve) => {
+      const globalDshBin = resolveGlobalDshBin()
       const npxInfo = resolveNpx()
-      const cmdArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', 'plugin', '--profile', profile, ...args]
+      const nodeInfo = resolveNode()
+
+      if (!globalDshBin && (!npxInfo || !nodeInfo.path)) {
+        resolve({ success: false, output: '', error: 'Node.js 或 npx 不可用' })
+        return
+      }
+
+      let cmd, cmdArgs, useShell
+      const env = { ...process.env }
+      if (nodeInfo.path) {
+        const nodeDir = path.dirname(nodeInfo.path)
+        const pathSep = process.platform === 'win32' ? ';' : ':'
+        env.PATH = nodeDir + pathSep + (process.env.PATH || process.env.Path || '')
+      }
+      if (!env.npm_config_registry) {
+        env.npm_config_registry = 'https://registry.npmmirror.com'
+      }
+
+      if (globalDshBin) {
+        cmd = nodeInfo.path
+        cmdArgs = [globalDshBin, 'plugin', '--profile', profile, ...args]
+        useShell = false
+      } else {
+        cmd = npxInfo.cmd
+        cmdArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', 'plugin', '--profile', profile, ...args]
+        useShell = npxInfo.shell
+      }
 
       let output = ''
       let errorOutput = ''
 
-      const child = spawn(npxInfo.cmd, cmdArgs, {
+      const child = spawn(cmd, cmdArgs, {
         cwd: process.cwd(),
-        env: { ...process.env },
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
-        shell: npxInfo.shell,
+        shell: useShell,
       })
 
       child.stdout.on('data', (data) => {
@@ -1341,16 +1513,26 @@ window.dsh.cli = {
    * @returns {string|null}
    */
   getVersion() {
-    const npxInfo = resolveNpx()
     const nodeInfo = resolveNode()
-    if (!npxInfo || !nodeInfo.path) return null
+    const globalDshBin = resolveGlobalDshBin()
+    if (!nodeInfo.path) return null
+    const pathSep = process.platform === 'win32' ? ';' : ':'
+    const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + (process.env.PATH || process.env.Path || '') }
+    // Prefer global DSH (fast), fall back to npx
+    if (globalDshBin) {
+      try {
+        const out = execSync(`"${nodeInfo.path}" "${globalDshBin}" --version`, {
+          encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000, env,
+        })
+        return out.trim()
+      } catch { /* fall through */ }
+    }
+    const npxInfo = resolveNpx()
+    if (!npxInfo) return null
     try {
       const npxArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'].join(' ')
       const out = execSync(`"${npxInfo.cmd}" ${npxArgs}`, {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-        timeout: 30000,
-        env: { ...process.env, PATH: path.dirname(nodeInfo.path) + (process.platform === 'win32' ? ';' : ':') + (process.env.PATH || '') },
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 30000, env,
       })
       return out.trim()
     } catch {
@@ -1374,10 +1556,21 @@ window.dsh.cli = {
   async install(callbacks = {}) {
     return new Promise((resolve) => {
       const npxInfo = resolveNpx()
+      const nodeInfo = resolveNode()
+      if (!npxInfo) { resolve(false); return }
+      const env = { ...process.env }
+      if (nodeInfo.path) {
+        const pathSep = process.platform === 'win32' ? ';' : ':'
+        env.PATH = path.dirname(nodeInfo.path) + pathSep + (process.env.PATH || process.env.Path || '')
+      }
+      // Use China-friendly registry by default (user can override via .npmrc)
+      if (!env.npm_config_registry) {
+        env.npm_config_registry = 'https://registry.npmmirror.com'
+      }
       // Running npx with the package will trigger install
       const child = spawn(npxInfo.cmd, [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'], {
         cwd: process.cwd(),
-        env: { ...process.env },
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: npxInfo.shell,
       })
@@ -1405,14 +1598,23 @@ window.dsh.cli = {
 // ------------------------------------------------------------
 
 /**
- * Generic DSH RPC call. DSH uses POST /api/<namespace>.<method>
- * with a JSON body containing the payload.
- * @param {string} method - e.g. 'session.list'
- * @param {object} payload - request payload
+ * Generic DSH RPC call. DSH uses POST /api/<namespace>/<method>
+ * with a ClientRequest envelope body.
+ * @param {string} method - e.g. 'session.list' (dot-separated; converted to slash)
+ * @param {object} payload - request payload (wrapped in args field)
  * @returns {Promise<object>} response value
  */
 async function rpc(method, payload = {}) {
-  const result = await httpRequest('POST', `/api/${method}`, payload)
+  // DSH RPC wire format: endpoint uses '/' separator (session/list, not session.list)
+  const endpoint = method.replace('.', '/')
+  const rpcId = crypto.randomUUID()
+  const body = {
+    type: 'client-request',
+    rpcId,
+    method: endpoint,
+    payload: { args: payload },
+  }
+  const result = await httpRequest('POST', `/api/${endpoint}`, body)
   if (result.statusCode >= 400) {
     const errData = result.data
     const errMsg = errData?.result?.error?.message || errData?.error?.message || `HTTP ${result.statusCode}`
@@ -1972,6 +2174,141 @@ window.dsh.fs = {
     } catch { /* not available */ }
     return null
   },
+}
+
+// ------------------------------------------------------------
+//  utoolsAi — uTools AI ecosystem bridge
+// ------------------------------------------------------------
+
+window.dsh.utoolsAi = {
+  /**
+   * Check if uTools AI API is available (uTools >= 7.0).
+   * @returns {boolean}
+   */
+  isAvailable() {
+    return typeof utools !== 'undefined' && typeof utools.ai === 'function'
+  },
+
+  /**
+   * Get all AI models registered in uTools.
+   * @returns {Promise<Array<{id:string,label:string,description:string,icon:string,cost:number}>>}
+   */
+  async getModels() {
+    if (typeof utools !== 'undefined' && utools.allAiModels) {
+      try {
+        return await utools.allAiModels()
+      } catch {
+        return []
+      }
+    }
+    return []
+  },
+
+  /**
+   * Stream a chat completion via uTools AI.
+   * @param {Array<{role:string,content:string}>} messages
+   * @param {string} [model] - Model ID (empty = default deepseek-v3)
+   * @param {Array} [tools] - Function Calling tools
+   * @param {(chunk:string)=>void} [onChunk] - Stream callback
+   * @returns {Promise<{content:string}>}
+   */
+  async chat(messages, model, tools, onChunk) {
+    if (!this.isAvailable()) {
+      throw new Error('uTools AI 不可用 (需要 uTools 7.0+)')
+    }
+    const option = { messages }
+    if (model) option.model = model
+    if (tools && tools.length > 0) option.tools = tools
+
+    if (onChunk) {
+      let fullContent = ''
+      await utools.ai(option, (chunk) => {
+        if (chunk && chunk.content) {
+          fullContent += chunk.content
+          onChunk(chunk.content)
+        }
+      })
+      return { content: fullContent }
+    }
+    const result = await utools.ai(option)
+    return { content: (result && result.content) || '' }
+  },
+}
+
+// ============================================================
+//  MCP Tool Registration — expose DSH capabilities to uTools AI Agent
+//  Must run at preload init, NOT inside onPluginEnter.
+// ============================================================
+
+if (typeof utools !== 'undefined' && utools.registerTool) {
+  try {
+
+  utools.registerTool('dsh_run_headless', async (params, ctx) => {
+    const { task, workspace } = params
+    ctx?.sendProgress?.({ progress: 0, total: 1, message: '正在启动 DSH…' })
+
+    const status = window.dsh.server.getStatus()
+    if (!status.running) {
+      const ws = workspace || window.dsh.workspace.getCurrent()
+      await window.dsh.server.start({ workspace: ws, port: 3080, profile: 'web' })
+    }
+
+    ctx?.sendProgress?.({ progress: 0, total: 1, message: '任务执行中…' })
+
+    const result = await window.dsh.cli.runHeadless(task, {
+      workspace: workspace || window.dsh.workspace.getCurrent(),
+    })
+
+    if (result.success) {
+      return { success: true, output: result.output }
+    }
+    throw new Error(result.error || '任务执行失败')
+  })
+
+  utools.registerTool('dsh_list_sessions', async (params) => {
+    const { query } = params || {}
+    try {
+      if (query) {
+        return await window.dsh.api.session.search(query)
+      }
+      return await window.dsh.api.session.list()
+    } catch (err) {
+      throw new Error('无法获取会话列表: ' + err.message)
+    }
+  })
+
+  utools.registerTool('dsh_read_file', async (params) => {
+    const { path: filePath } = params
+    if (!window.dsh.fs.exists(filePath)) {
+      throw new Error(`文件不存在: ${filePath}`)
+    }
+    const content = window.dsh.fs.readFile(filePath)
+    if (content.length > 50000) {
+      return content.slice(0, 50000) + '\n\n... (已截断，总长度: ' + content.length + ')'
+    }
+    return content
+  })
+
+  utools.registerTool('dsh_search_sessions', async (params) => {
+    const { query } = params
+    return await window.dsh.api.session.search(query)
+  })
+
+  utools.registerTool('dsh_get_server_status', async () => {
+    const status = window.dsh.server.getStatus()
+    return {
+      running: status.running,
+      url: window.dsh.server.getServerUrl(),
+      port: status.port,
+      pid: status.pid,
+      uptime: status.uptime,
+      workspace: status.workspace,
+    }
+  })
+
+  } catch (e) {
+    console.error('[dsh] MCP tool registration failed:', e.message)
+  }
 }
 
 // ============================================================

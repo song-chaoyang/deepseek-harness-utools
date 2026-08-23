@@ -69,6 +69,9 @@ const Settings = {
       statusEl.classList.remove('configured')
     }
 
+    // uTools AI provider card
+    await this.renderUtoolsAiCard()
+
     // Load custom providers from settings
     const settings = window.dsh.config.getSettings()
     const providers = settings['llm-pi-ai']?.providers || {}
@@ -105,6 +108,67 @@ const Settings = {
         btn.addEventListener('click', () => this.removeProvider(btn.dataset.removeProvider))
       })
     }
+  },
+
+  /**
+   * Render the uTools AI provider card on the models tab.
+   */
+  async renderUtoolsAiCard() {
+    // Insert after the DeepSeek provider card
+    const deepseekCard = document.getElementById('provider-deepseek')
+    if (!deepseekCard) return
+
+    // Remove existing card if re-rendering
+    const existing = document.getElementById('provider-utools-ai')
+    if (existing) existing.remove()
+
+    const available = window.dsh.utoolsAi.isAvailable()
+    if (!available) {
+      deepseekCard.insertAdjacentHTML('afterend', `
+        <div class="provider-card" id="provider-utools-ai" style="opacity:0.6">
+          <div class="provider-header">
+            <h3>⚡ uTools AI</h3>
+            <span class="provider-status">不可用 (需 uTools 7.0+)</span>
+          </div>
+        </div>
+      `)
+      return
+    }
+
+    let models = []
+    try {
+      models = await window.dsh.utoolsAi.getModels()
+    } catch { /* ignore */ }
+
+    const modelsHtml = models.length > 0
+      ? models.map((m) => `
+          <div class="utools-ai-model-item">
+            <img src="${DshUtils.escapeHtml(m.icon || '')}" class="utools-ai-model-icon" alt=""
+              onerror="this.style.display='none'">
+            <div class="utools-ai-model-info">
+              <div class="utools-ai-model-label">${DshUtils.escapeHtml(m.label)}</div>
+              <div class="utools-ai-model-desc">${DshUtils.escapeHtml(m.description || '')}</div>
+            </div>
+            <span class="utools-ai-model-cost">💰 ${m.cost}</span>
+          </div>
+        `).join('')
+      : '<div class="workspace-empty" style="margin:0">未发现可用模型</div>'
+
+    deepseekCard.insertAdjacentHTML('afterend', `
+      <div class="provider-card" id="provider-utools-ai">
+        <div class="provider-header">
+          <h3>⚡ uTools AI</h3>
+          <span class="provider-status configured">可用 (${models.length} 个模型)</span>
+        </div>
+        <div class="provider-body">
+          <div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px">
+            使用 uTools 内置 AI 能力，无需配置 API Key。支持 Function Calling。
+            可在 Headless 任务中选择 uTools AI 模型执行。
+          </div>
+          <div class="utools-ai-model-list">${modelsHtml}</div>
+        </div>
+      </div>
+    `)
   },
 
   /**
@@ -409,8 +473,26 @@ const Settings = {
    * Load environment check tab.
    */
   async loadEnvTab() {
-    const results = window.dsh.env.checkPrerequisites()
+    // Use skipDshCheck to avoid blocking execSync with 30s npx timeout
+    const results = window.dsh.env.checkPrerequisites({ skipDshCheck: true })
     ServerManager.showEnvResults(results)
+
+    // Async DSH check (non-blocking)
+    try {
+      const dshResult = await window.dsh.env.hasDshInstalledAsync()
+      const dshRow = document.querySelector('#env-check-list-settings .env-check-item:last-child')
+      if (dshRow) {
+        const icon = dshRow.querySelector('.env-check-icon')
+        const result = dshRow.querySelector('.env-check-result')
+        if (icon) icon.textContent = dshResult.installed ? '✅' : '⚠️'
+        if (result) {
+          result.textContent = dshResult.installed
+            ? `${dshResult.version} (${dshResult.method})`
+            : '未安装 (首次运行自动安装)'
+          result.className = `env-check-result ${dshResult.installed ? 'success' : 'warning'}`
+        }
+      }
+    } catch { /* ignore */ }
   },
 
   /**
@@ -438,8 +520,10 @@ const Settings = {
       listEl.innerHTML = '<div class="loading-container"><div class="loading-spinner"></div><div class="loading-text">正在安装/更新 DSH...\n首次安装可能需要几分钟</div></div>'
     }
 
+    DshUtils.log('开始安装/更新 DSH...', 'info')
     const ok = await window.dsh.cli.install({
       onOutput: (text) => {
+        DshUtils.log(text.trim(), 'info')
         const existing = listEl.querySelector('.loading-text')
         if (existing) {
           existing.textContent = '正在安装/更新 DSH...\n' + text.slice(-500)
@@ -449,6 +533,8 @@ const Settings = {
 
     btn.disabled = false
     btn.textContent = '安装/更新 DSH'
+
+    DshUtils.log(ok ? 'DSH 安装/更新完成' : 'DSH 安装失败', ok ? 'info' : 'error')
 
     if (ok) {
       DshUtils.notify('DSH 安装/更新完成')

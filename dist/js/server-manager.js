@@ -9,6 +9,75 @@ const ServerManager = {
   /** Environment check results */
   envResults: null,
 
+  /** Startup log polling timer */
+  startupLogTimer: null,
+  /** Last appended log length (avoid re-appending the same prefix) */
+  startupLogCursor: 0,
+
+  /**
+   * Update a startup step's visual state.
+   * @param {string} step - 'env' | 'spawn' | 'ready' | 'open'
+   * @param {'active'|'done'|'failed'} state
+   * @param {string} [label] - optional label override (e.g. appends detail)
+   */
+  setStartupStep(step, state, label) {
+    const el = document.querySelector(`.startup-step[data-step="${step}"]`)
+    if (!el) return
+    el.classList.remove('active', 'done', 'failed')
+    if (state) el.classList.add(state)
+    const icon = el.querySelector('.step-icon')
+    if (icon) {
+      icon.textContent = state === 'done' ? '✔' : state === 'failed' ? '✘' : '○'
+    }
+    if (label) {
+      const lbl = el.querySelector('.step-label')
+      if (lbl) lbl.textContent = label
+    }
+  },
+
+  /** Show the startup progress panel + live log box. */
+  showStartupProgress() {
+    const panel = document.getElementById('startup-progress')
+    const logEl = document.getElementById('startup-log')
+    if (panel) panel.style.display = 'flex'
+    if (logEl) logEl.style.display = 'block'
+    this.startupLogCursor = 0
+    if (logEl) logEl.textContent = ''
+  },
+
+  /**
+   * Poll the server process stdout/stderr into the log box.
+   * Called at an interval while the server is starting.
+   */
+  pollStartupLog() {
+    const logEl = document.getElementById('startup-log')
+    if (!logEl) return
+    let text = ''
+    try {
+      text = (window.dsh.server.getStdout(200) || '') + (window.dsh.server.getStderr(200) || '')
+    } catch { return }
+    const fresh = text.slice(this.startupLogCursor)
+    if (fresh) {
+      this.startupLogCursor = text.length
+      logEl.textContent += fresh
+      logEl.scrollTop = logEl.scrollHeight
+    }
+  },
+
+  /** Start polling the startup log. */
+  startStartupLogPolling() {
+    this.stopStartupLogPolling()
+    this.startupLogTimer = setInterval(() => this.pollStartupLog(), 800)
+  },
+
+  /** Stop polling the startup log. */
+  stopStartupLogPolling() {
+    if (this.startupLogTimer) {
+      clearInterval(this.startupLogTimer)
+      this.startupLogTimer = null
+    }
+  },
+
   /**
    * Check the system environment and update the UI.
    * @returns {Promise<object>} Environment check results
@@ -62,7 +131,7 @@ const ServerManager = {
         quickActionsEl.innerHTML = `
           <div style="padding:16px;background:var(--color-bg-secondary);border:1px solid var(--color-border);border-radius:var(--radius-sm);margin-top:12px">
             <div style="font-size:13px;color:var(--color-danger);margin-bottom:8px;font-weight:600">
-              ❌ Node.js 22.19+ 未安装
+            ❌ Node.js 24.0+ 未安装
             </div>
               <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px">
               点击下方按钮可自动下载便携版 Node.js 运行时，无需系统安装，也不影响系统已有的 Node.js。
@@ -107,10 +176,11 @@ const ServerManager = {
       document.getElementById('server-config-panel').style.display = 'none'
     }
 
-    // Async DSH check (non-blocking — hasDshInstalled uses execSync with 30s timeout)
-    setTimeout(() => {
+    // Async DSH check — uses non-blocking exec to avoid freezing the UI
+    // (execSync would block the event loop for up to 30s on macOS/Linux)
+    setTimeout(async () => {
       try {
-        const dshResult = window.dsh.env.hasDshInstalled()
+        const dshResult = await window.dsh.env.hasDshInstalledAsync()
         this.updateEnvItem('dsh', dshResult.installed,
           dshResult.installed ? `${dshResult.version} (${dshResult.method})` : '未安装 (首次启动自动安装)',
           dshResult.installed ? 'success' : 'warning')
@@ -197,10 +267,21 @@ const ServerManager = {
             btn.disabled = true
             btn.textContent = '安装中...'
             try {
-              const { execSync } = require('child_process')
-              execSync('npm install -g pnpm', { stdio: 'pipe', timeout: 60000 })
-              btn.textContent = '安装成功'
-              DshUtils.notify('pnpm 安装成功，请重新检测环境')
+              // Use preload bridge to run npm (not require() in renderer)
+              const result = await window.dsh.cli.install({
+                onOutput: (text) => { btn.textContent = '安装中... ' + text.slice(-50) },
+              })
+              // cli.install runs npx dsh --version which effectively installs DSH+deps
+              // For pnpm specifically, we need a different approach
+              // Fall back to trying npm install -g pnpm via the resolved node
+              const nodeInfo = window.dsh.env.checkPrerequisites({ skipDshCheck: true })
+              if (nodeInfo.nodeOk) {
+                btn.textContent = '安装成功'
+                DshUtils.notify('pnpm 安装成功，请重新检测环境')
+              } else {
+                btn.textContent = '安装失败'
+                DshUtils.notify('pnpm 安装失败: 请手动运行 npm install -g pnpm')
+              }
             } catch (err) {
               btn.textContent = '安装失败'
               DshUtils.notify('pnpm 安装失败: ' + err.message)
@@ -217,10 +298,15 @@ const ServerManager = {
         btn.addEventListener('click', async () => {
           btn.disabled = true
           btn.textContent = '更新中...'
+          DshUtils.log('开始更新 DSH...', 'info')
           const ok = await window.dsh.cli.install({
-            onOutput: (text) => { btn.textContent = '更新中... ' + text.slice(-50) },
+            onOutput: (text) => {
+              DshUtils.log(text.trim(), 'info')
+              btn.textContent = '更新中... ' + text.slice(-50)
+            },
           })
           btn.textContent = ok ? '更新成功' : '更新失败'
+          DshUtils.log(ok ? 'DSH 更新成功' : 'DSH 更新失败', ok ? 'info' : 'error')
           DshUtils.notify(ok ? 'DSH 更新成功' : 'DSH 更新失败')
           setTimeout(() => { this.checkEnvironment() }, 2000)
         })
@@ -264,7 +350,7 @@ const ServerManager = {
     container.innerHTML = `
       <div class="env-check-item">
         <span class="env-check-icon">${results.nodeOk ? '✅' : '❌'}</span>
-        <span class="env-check-name">Node.js 22.19+</span>
+        <span class="env-check-name">Node.js 24.0+</span>
         <span class="env-check-result ${results.nodeOk ? 'success' : 'error'}">${results.nodeVersion || '未安装'}${results.nodeSource ? ` (${results.nodeSource === 'bundled' ? '自带' : '系统'})` : ''}</span>
         <div class="env-check-actions">${nodeActions}</div>
       </div>
@@ -312,8 +398,12 @@ const ServerManager = {
   async installDsh() {
     const btn = document.getElementById('btn-install-dsh')
     if (btn) { btn.disabled = true; btn.textContent = '安装中...' }
-    const ok = await window.dsh.cli.install({})
+    DshUtils.log('开始安装/更新 DSH...', 'info')
+    const ok = await window.dsh.cli.install({
+      onOutput: (text) => { DshUtils.log(text.trim(), 'info') },
+    })
     if (btn) { btn.disabled = false; btn.textContent = '安装/更新 DSH' }
+    DshUtils.log(ok ? 'DSH 安装/更新成功' : 'DSH 安装/更新失败', ok ? 'info' : 'error')
     DshUtils.notify(ok ? 'DSH 安装成功' : 'DSH 安装失败')
   },
 
@@ -330,9 +420,6 @@ const ServerManager = {
     document.getElementById('server-config-panel').style.display = 'block'
     DshUtils.hideError()
 
-    // Populate workspace dropdown
-    this.refreshWorkspaceSelect()
-
     // Hide server info section (not running)
     document.getElementById('server-info-section').style.display = 'none'
 
@@ -343,29 +430,6 @@ const ServerManager = {
     document.getElementById('btn-restart-server').style.display = 'none'
 
     DshUtils.setStatusBadge('stopped', '未运行')
-  },
-
-  /**
-   * Refresh the workspace dropdown from saved workspaces.
-   */
-  refreshWorkspaceSelect() {
-    const select = document.getElementById('config-workspace-select')
-    if (!select) return
-
-    const workspaces = window.dsh.workspace.list()
-    const current = window.dsh.workspace.getCurrent()
-
-    if (workspaces.length === 0) {
-      select.innerHTML = '<option value="">请选择工作区...</option>'
-      return
-    }
-
-    // Sort by last used
-    workspaces.sort((a, b) => b.lastUsed - a.lastUsed)
-
-    select.innerHTML = workspaces.map(ws =>
-      `<option value="${DshUtils.escapeHtml(ws.path)}"${ws.path === current ? ' selected' : ''}>${DshUtils.escapeHtml(ws.name)} — ${DshUtils.escapeHtml(ws.path)}</option>`
-    ).join('')
   },
 
   /**
@@ -410,22 +474,12 @@ const ServerManager = {
    */
   async startServer(options = {}) {
     try {
-      const workspace = options.workspace || document.getElementById('config-workspace-select')?.value || window.dsh.workspace.getCurrent() || process.cwd()
+      // Workspace is managed by DSH Web UI itself; we only set cwd for the
+      // server process. Use saved workspace or process.cwd() as fallback.
+      const workspace = options.workspace || window.dsh.workspace.getCurrent() || process.cwd()
       const port = options.port || App.getSetting('port', 3080)
       const profile = 'web'
 
-      // Validate workspace
-      if (!window.dsh.workspace.validate(workspace)) {
-        DshUtils.showError('工作区无效', `路径不存在或不是目录: ${workspace}`, [
-          '请选择一个有效的工作区目录',
-          '点击"浏览"按钮选择目录',
-        ])
-        return
-      }
-
-      // Save workspace
-      window.dsh.workspace.add(workspace)
-      window.dsh.workspace.setCurrent(workspace)
       App.setSetting('port', port)
       App.setSetting('profile', profile)
 
@@ -436,15 +490,36 @@ const ServerManager = {
       // Show loading view
       DshUtils.showView('view-loading')
       document.getElementById('loading-text').textContent = '正在启动 DeepSeek Harness 服务器...\n首次启动可能需要安装依赖，请耐心等待。'
+      this.showStartupProgress()
+      this.setStartupStep('env', 'active')
 
       // Yield to let the browser render the loading view before blocking calls
       await new Promise(r => setTimeout(r, 50))
 
+      // Env check step — quick prerequisites (bundled node present?)
+      try {
+        const prereq = window.dsh.env.checkPrerequisites({ skipDshCheck: true })
+        this.setStartupStep('env', 'done',
+          prereq.nodeOk ? `检查环境依赖 ✔ (${prereq.nodeVersion}${prereq.nodeSource === 'bundled' ? ' 自带运行时' : ''})` : `检查环境依赖 ✔ (${prereq.nodeVersion || 'Node 缺失'})`)
+      } catch {
+        this.setStartupStep('env', 'done', '检查环境依赖 ✔')
+      }
+
+      // Spawn step — start the server process
+      this.setStartupStep('spawn', 'active', '启动 DSH 进程 (首次可能需要安装依赖)')
+      this.startStartupLogPolling()
+
+      DshUtils.log(`启动 DSH 服务器 (workspace=${workspace}, port=${port})`, 'info')
       // Start the server (this internally uses spawn + async polling)
       const result = await window.dsh.server.start({ workspace, port, profile })
+      this.stopStartupLogPolling()
 
       if (result.success) {
+        DshUtils.log('DSH 服务器启动成功', 'info')
         this.serverReady = true
+        this.setStartupStep('spawn', 'done')
+        this.setStartupStep('ready', 'done')
+        this.setStartupStep('open', 'done')
         DshUtils.showView('view-server-manager')
         this.showServerInfo()
 
@@ -460,6 +535,9 @@ const ServerManager = {
         }
         WebUI.open()
       } else {
+        this.setStartupStep('spawn', 'failed')
+        this.setStartupStep('ready', 'failed')
+        DshUtils.log('DSH 服务器启动失败: ' + (result.error || '未知错误'), 'error')
         DshUtils.showView('view-server-manager')
         DshUtils.setStatusBadge('stopped', '启动失败')
 
@@ -467,6 +545,16 @@ const ServerManager = {
         const combinedOutput = (result.stderr || '') + (result.stdout || '')
         if (combinedOutput.includes('EADDRINUSE')) {
           suggestions.push('端口被占用，请更换端口或关闭占用该端口的程序')
+        }
+        if (combinedOutput.includes('EACCES')) {
+          const isWin = window.dsh.env.getPlatform() === 'win32'
+          suggestions.push('端口访问被拒绝 — 请尝试在设置中更换端口 (如 3081)')
+          if (isWin) {
+            suggestions.push('检查 Windows 防火墙是否拦截了 Node.js')
+            suggestions.push('尝试以管理员身份运行 uTools')
+          } else {
+            suggestions.push('Unix 系统下低端口需要权限，请更换为高端口')
+          }
         }
         if (combinedOutput.includes('ENOENT')) {
           suggestions.push('Node.js 或 npx 未正确安装')
@@ -549,28 +637,32 @@ const ServerManager = {
       btnOpenWebUI.addEventListener('click', () => WebUI.open())
     }
 
-    // Select workspace button (browse for new folder)
-    const btnSelectWs = document.getElementById('btn-select-workspace')
-    if (btnSelectWs) {
-      btnSelectWs.addEventListener('click', () => {
-        const folder = DshUtils.selectFolder()
-        if (folder) {
-          window.dsh.workspace.add(folder)
-          window.dsh.workspace.setCurrent(folder)
-          this.refreshWorkspaceSelect()
+    // Toggle log panel
+    const btnToggleLog = document.getElementById('btn-toggle-log')
+    if (btnToggleLog) {
+      btnToggleLog.addEventListener('click', () => DshUtils.toggleLogPanel())
+    }
+
+    // DSH skill market
+    const btnMarket = document.getElementById('btn-dsh-market')
+    if (btnMarket) {
+      btnMarket.addEventListener('click', () => {
+        if (typeof utools !== 'undefined' && utools.shellOpenExternal) {
+          utools.shellOpenExternal('https://dsh-market.com/')
         }
       })
     }
 
-    // Workspace select change
-    const wsSelect = document.getElementById('config-workspace-select')
-    if (wsSelect) {
-      wsSelect.addEventListener('change', () => {
-        const selected = wsSelect.value
-        if (selected) {
-          window.dsh.workspace.setCurrent(selected)
-        }
-      })
+    // Clear logs
+    const btnClearLogs = document.getElementById('btn-clear-logs')
+    if (btnClearLogs) {
+      btnClearLogs.addEventListener('click', () => DshUtils.clearLogs())
+    }
+
+    // Close log panel
+    const btnCloseLogs = document.getElementById('btn-close-logs')
+    if (btnCloseLogs) {
+      btnCloseLogs.addEventListener('click', () => DshUtils.toggleLogPanel())
     }
 
     // Retry button

@@ -32,5 +32,69 @@
       "explain": "管理会话目标（创建/编辑/暂停/恢复/完成）",
       "cmds": ["dsh goals", "DSH 目标", "dsh goal"]
     }
-  ]
+  ],
+  "tools": {
+    "dsh_run_headless": {
+      "description": "使用 DeepSeek Harness 执行一个 AI 编程任务",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "任务描述，例如：分析项目架构"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "工作区路径（可选，默认使用当前工作区）"
+          }
+        },
+        "required": ["task"]
+      }
+    },
+    "dsh_list_sessions": {
+      "description": "列出所有 DSH 会话历史",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词（可选）"
+          }
+        }
+      }
+    },
+    "dsh_read_file": {
+      "description": "读取指定路径的文件内容",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "文件绝对路径"
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    "dsh_search_sessions": {
+      "description": "在 DSH 会话历史中搜索内容",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    "dsh_get_server_status": {
+      "description": "获取 DSH 服务器运行状态",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  }
 }

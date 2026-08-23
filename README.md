@@ -35,11 +35,11 @@ DeepSeek Harness（DSH）是 DeepSeek AI 开源的 AI Agent 框架，架构理�
 
 | 界面 | 说明 |
 |---|---|
-| ![主界面](screenshots/01-main-environment.png) | 环境检测 + 服务器状态 |
-| ![Web UI](screenshots/02-web-ui-conversation.png) | DSH Web UI 对话界面 |
-| ![Headless](screenshots/03-headless-task.png) | Headless 任务运行器 |
-| ![设置](screenshots/04-settings-models.png) | 模型配置页面 |
-| ![会话](screenshots/05-sessions-list.png) | 会话历史浏览器 |
+| ![主界面](dist/screenshots/01-main-environment.png) | 环境检测 + 服务器状态 |
+| ![Web UI](dist/screenshots/02-web-ui-conversation.png) | DSH Web UI 对话界面 |
+| ![Headless](dist/screenshots/03-headless-task.png) | Headless 任务运行器 |
+| ![设置](dist/screenshots/04-settings-models.png) | 模型配置页面 |
+| ![会话](dist/screenshots/05-sessions-list.png) | 会话历史浏览器 |
 
 ## 快速开始
 

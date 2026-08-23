@@ -22,7 +22,7 @@ DeepSeek Harness（DSH）是 DeepSeek AI 开源的 AI Agent 框架，架构理�
 
 ## 核心特性
 
-- 🔧 **自带运行时** — 内置 Node.js v24.11.0 LTS，不依赖系统环境
+- 🔧 **按需运行时** — 首次启动自动下载 Node.js v24 LTS，不依赖系统环境
 - 🎯 **完整能力** — DSH 全部 52 个 RPC API + 22 个工具完整覆盖
 - 🤖 **多模型支持** — DeepSeek / Anthropic / OpenAI / 自定义 Provider
 - 📋 **Headless 模式** — 输入任务描述，流式输出结果，支持粘贴到其他应用
@@ -44,10 +44,9 @@ DeepSeek Harness（DSH）是 DeepSeek AI 开源的 AI Agent 框架，架构理�
 ## 快速开始
 
 1. 在 uTools 中输入 `dsh`
-2. 环境检测自动通过（自带 Node.js 运行时）
-3. 选择工作区目录
-4. 点击"启动服务器"
-5. Web UI 自动打开，开始使用
+2. 首次使用自动下载 Node.js 运行时（约 85MB，仅需一次）
+3. 环境检测通过后点击"启动服务器"
+4. Web UI 自动打开，开始使用
 
 ## 配置模型
 

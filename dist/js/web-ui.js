@@ -15,6 +15,12 @@ const WebUI = {
   /** Load timeout timer */
   loadTimeout: null,
 
+  /** Log panel polling timer */
+  logTimer: null,
+
+  /** Log panel cursor */
+  logCursor: 0,
+
   /**
    * Open the Web UI view.
    */
@@ -179,6 +185,83 @@ const WebUI = {
   },
 
   /**
+   * Toggle the log panel visibility.
+   */
+  toggleLogs() {
+    const panel = document.getElementById('log-panel')
+    if (!panel) return
+    if (panel.style.display === 'flex') {
+      this.stopLogPolling()
+      panel.style.display = 'none'
+    } else {
+      panel.style.display = 'flex'
+      this.logCursor = 0
+      this.startLogPolling()
+    }
+  },
+
+  /**
+   * Start polling server stdout/stderr into the log panel.
+   */
+  startLogPolling() {
+    this.stopLogPolling()
+    this.pollLogs()
+    this.logTimer = setInterval(() => this.pollLogs(), 1000)
+  },
+
+  /**
+   * Stop polling logs.
+   */
+  stopLogPolling() {
+    if (this.logTimer) {
+      clearInterval(this.logTimer)
+      this.logTimer = null
+    }
+  },
+
+  /**
+   * Poll server output and append to log panel.
+   */
+  pollLogs() {
+    const logEl = document.getElementById('log-content')
+    if (!logEl) return
+    let text = ''
+    try {
+      text = (window.dsh.server.getStdout(200) || '') + (window.dsh.server.getStderr(200) || '')
+    } catch { return }
+    const fresh = text.slice(this.logCursor)
+    if (fresh) {
+      this.logCursor = text.length
+      // Highlight errors and warnings
+      const escaped = DshUtils.escapeHtml(fresh)
+      const colored = escaped
+        .replace(/(error|Error|ERROR)/g, '<span class="log-error">$1</span>')
+        .replace(/(warn|Warn|WARN)/g, '<span class="log-warn">$1</span>')
+      logEl.innerHTML += colored
+      // Limit log panel content to ~500 lines to prevent memory bloat
+      const maxChars = 50000
+      if (logEl.innerHTML.length > maxChars) {
+        logEl.innerHTML = logEl.innerHTML.slice(-maxChars)
+      }
+      logEl.scrollTop = logEl.scrollHeight
+    }
+  },
+
+  /**
+   * Clear the log panel.
+   */
+  clearLogs() {
+    const logEl = document.getElementById('log-content')
+    if (logEl) logEl.innerHTML = ''
+    // Advance cursor to current end so old buffered content is not re-shown
+    let text = ''
+    try {
+      text = (window.dsh.server.getStdout(200) || '') + (window.dsh.server.getStderr(200) || '')
+    } catch { /* ignore */ }
+    this.logCursor = text.length
+  },
+
+  /**
    * Initialize event listeners.
    */
   init() {
@@ -201,6 +284,21 @@ const WebUI = {
     const btnExternal = document.getElementById('btn-open-external')
     if (btnExternal) {
       btnExternal.addEventListener('click', () => this.openExternal())
+    }
+
+    const btnLogs = document.getElementById('btn-show-logs')
+    if (btnLogs) {
+      btnLogs.addEventListener('click', () => this.toggleLogs())
+    }
+
+    const btnCloseLogs = document.getElementById('btn-close-logs')
+    if (btnCloseLogs) {
+      btnCloseLogs.addEventListener('click', () => this.toggleLogs())
+    }
+
+    const btnClearLogs = document.getElementById('btn-clear-logs')
+    if (btnClearLogs) {
+      btnClearLogs.addEventListener('click', () => this.clearLogs())
     }
   },
 }

@@ -69,6 +69,9 @@ const Settings = {
       statusEl.classList.remove('configured')
     }
 
+    // uTools AI provider card
+    await this.renderUtoolsAiCard()
+
     // Load custom providers from settings
     const settings = window.dsh.config.getSettings()
     const providers = settings['llm-pi-ai']?.providers || {}
@@ -105,6 +108,67 @@ const Settings = {
         btn.addEventListener('click', () => this.removeProvider(btn.dataset.removeProvider))
       })
     }
+  },
+
+  /**
+   * Render the uTools AI provider card on the models tab.
+   */
+  async renderUtoolsAiCard() {
+    // Insert after the DeepSeek provider card
+    const deepseekCard = document.getElementById('provider-deepseek')
+    if (!deepseekCard) return
+
+    // Remove existing card if re-rendering
+    const existing = document.getElementById('provider-utools-ai')
+    if (existing) existing.remove()
+
+    const available = window.dsh.utoolsAi.isAvailable()
+    if (!available) {
+      deepseekCard.insertAdjacentHTML('afterend', `
+        <div class="provider-card" id="provider-utools-ai" style="opacity:0.6">
+          <div class="provider-header">
+            <h3>⚡ uTools AI</h3>
+            <span class="provider-status">不可用 (需 uTools 7.0+)</span>
+          </div>
+        </div>
+      `)
+      return
+    }
+
+    let models = []
+    try {
+      models = await window.dsh.utoolsAi.getModels()
+    } catch { /* ignore */ }
+
+    const modelsHtml = models.length > 0
+      ? models.map((m) => `
+          <div class="utools-ai-model-item">
+            <img src="${DshUtils.escapeHtml(m.icon || '')}" class="utools-ai-model-icon" alt=""
+              onerror="this.style.display='none'">
+            <div class="utools-ai-model-info">
+              <div class="utools-ai-model-label">${DshUtils.escapeHtml(m.label)}</div>
+              <div class="utools-ai-model-desc">${DshUtils.escapeHtml(m.description || '')}</div>
+            </div>
+            <span class="utools-ai-model-cost">💰 ${m.cost}</span>
+          </div>
+        `).join('')
+      : '<div class="workspace-empty" style="margin:0">未发现可用模型</div>'
+
+    deepseekCard.insertAdjacentHTML('afterend', `
+      <div class="provider-card" id="provider-utools-ai">
+        <div class="provider-header">
+          <h3>⚡ uTools AI</h3>
+          <span class="provider-status configured">可用 (${models.length} 个模型)</span>
+        </div>
+        <div class="provider-body">
+          <div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px">
+            使用 uTools 内置 AI 能力，无需配置 API Key。支持 Function Calling。
+            可在 Headless 任务中选择 uTools AI 模型执行。
+          </div>
+          <div class="utools-ai-model-list">${modelsHtml}</div>
+        </div>
+      </div>
+    `)
   },
 
   /**

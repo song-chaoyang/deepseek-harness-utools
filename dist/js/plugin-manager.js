@@ -273,3 +273,5 @@ const PluginManager = {
     }
   },
 }
+
+window.PluginManager = PluginManager

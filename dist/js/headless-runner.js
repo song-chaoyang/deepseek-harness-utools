@@ -349,6 +349,12 @@ const HeadlessRunner = {
   },
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  HeadlessRunner.init()
-})
+;(function () {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => HeadlessRunner.init())
+  } else {
+    HeadlessRunner.init()
+  }
+})()
+
+window.HeadlessRunner = HeadlessRunner

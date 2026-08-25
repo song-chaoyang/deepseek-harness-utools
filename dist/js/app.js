@@ -1,37 +1,37 @@
 /**
  * app.js — Main application router and event handler.
- *
- * Handles uTools plugin entry events and routes to the appropriate view
- * based on the feature code. Integrates uTools APIs: setSubInput,
- * setExpendHeight, onPluginDetach, dynamic features, redirect.
  */
 
-const App = {
-  /** Current feature code */
+// Global error handler — catches ALL uncaught errors and shows them in UI
+window.addEventListener('error', (e) => {
+  console.error('[dsh] Uncaught error:', e.error || e.message)
+  const panel = document.getElementById('error-panel')
+  if (panel && e.message) {
+    const title = document.getElementById('error-title')
+    const msg = document.getElementById('error-message')
+    if (title) title.textContent = '发生错误'
+    if (msg) msg.textContent = e.message + (e.error && e.error.stack ? '\n' + e.error.stack : '')
+    panel.style.display = 'block'
+  }
+})
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('[dsh] Unhandled rejection:', e.reason)
+})
+
+window.App = {
   currentCode: null,
-
-  /** Enter action data */
   enterAction: null,
-
-  /** Uptime timer interval */
   uptimeInterval: null,
+  /** When true, suppress dsh-server-exited from switching views (intentional stop/restart) */
+  suppressExitView: false,
 
-  /**
-   * Initialize the app on plugin enter.
-   * Called by utools.onPluginEnter.
-   * @param {object} action - PluginEnterAction
-   */
   async onEnter(action) {
     this.currentCode = action.code
     this.enterAction = action
 
-    // Apply theme
     DshUtils.applyTheme()
-
-    // Remove any existing sub-input
     this.removeSubInput()
 
-    // Route to the appropriate view
     switch (action.code) {
       case 'dsh-main':
         await this.showMain(action)
@@ -52,7 +52,6 @@ const App = {
         await this.showGoals(action)
         break
       default:
-        // Dynamic feature codes (e.g., dsh-session-xxx)
         if (action.code.startsWith('dsh-session-')) {
           await this.openSessionByCode(action.code, action)
         } else {
@@ -62,34 +61,55 @@ const App = {
   },
 
   /**
-   * Main view — server management + Web UI.
+   * Main view — server manager with env check + start button.
+   * If a server is already running, adopts it and opens Web UI.
    */
   async showMain(action) {
     DshUtils.showView('view-server-manager')
     DshUtils.hideError()
     this.setExpendHeight(600)
 
-    // Check environment first (fast check, non-blocking)
-    await ServerManager.checkEnvironment()
+    // Ensure button listeners are attached (in case DOMContentLoaded already fired)
+    ServerManager.init()
+    WebUI.init()
 
-    // Check if server is already running
+    // Yield to let the view render
+    await new Promise(r => setTimeout(r, 30))
+
+    // Check if server is already running (managed by us)
     const status = window.dsh.server.getStatus()
     if (status.running) {
       ServerManager.showServerInfo()
       const autoOpen = this.getSetting('autoOpenWebUI', true)
       if (autoOpen) {
+        this.setExpendHeight(800)
         WebUI.open()
       }
-    } else {
-      // Show config panel — user clicks "启动服务器" manually
-      // (auto-start removed: it blocks UI for 120s via waitForReady)
-      ServerManager.showConfigPanel()
+      return
     }
+
+    // Check if a DSH server is already listening (external or from previous session)
+    let existing
+    try {
+      existing = await window.dsh.server.healthCheck()
+    } catch {
+      existing = { healthy: false }
+    }
+
+    if (existing.healthy) {
+      const port = this.getSetting('port', 3080)
+      window.dsh.server.adoptExternal(port)
+      ServerManager.showServerInfo()
+      this.setExpendHeight(800)
+      WebUI.open()
+      return
+    }
+
+    // Show full server manager: env check + config panel
+    await ServerManager.checkEnvironment()
+    ServerManager.showConfigPanel()
   },
 
-  /**
-   * Headless task runner view.
-   */
   async showHeadless(action) {
     DshUtils.showView('view-headless')
     this.setExpendHeight(500)
@@ -107,31 +127,15 @@ const App = {
     await HeadlessRunner.loadModels()
   },
 
-  /**
-   * Settings view.
-   */
-  async showSettings(action) {
-    DshUtils.showView('view-settings')
-    this.setExpendHeight(600)
-    await Settings.init()
-  },
-
-  /**
-   * Sessions browser view.
-   */
   async showSessions(action) {
     DshUtils.showView('view-sessions')
     this.setExpendHeight(600)
-    // Set up sub-input for search
     this.setSubInput((value) => {
       SessionBrowser.search(value)
     }, '搜索会话...')
     await SessionBrowser.load()
   },
 
-  /**
-   * Plugin manager view.
-   */
   async showPluginManager(action) {
     DshUtils.showView('view-plugin-mgr')
     this.setExpendHeight(600)
@@ -141,12 +145,7 @@ const App = {
     await PluginManager.load()
   },
 
-  /**
-   * Workspace selector view.
-   */
   async showWorkspace(action) {
-    // Workspace selection is handled by DSH Web UI itself.
-    // If a folder is dropped, set it as cwd for the server process.
     if (action.type === 'file' && action.payload) {
       const files = Array.isArray(action.payload) ? action.payload : [action.payload]
       const dir = files.find((f) => f.isDirectory)
@@ -161,21 +160,14 @@ const App = {
     ServerManager.showConfigPanel()
   },
 
-  /**
-   * Goals view.
-   */
   async showGoals(action) {
     DshUtils.showView('view-sessions')
     this.setExpendHeight(600)
     await GoalManager.load()
   },
 
-  /**
-   * Open a session by dynamic feature code.
-   */
   async openSessionByCode(code, action) {
     const sessionId = code.replace('dsh-session-', '')
-    // Ensure server is running
     const status = window.dsh.server.getStatus()
     if (!status.running) {
       const port = this.getSetting('port', 3080)
@@ -189,11 +181,6 @@ const App = {
   //  uTools API wrappers
   // ============================================================
 
-  /**
-   * Set sub-input for search/filtering.
-   * @param {Function} callback
-   * @param {string} placeholder
-   */
   setSubInput(callback, placeholder = '搜索...') {
     if (typeof utools !== 'undefined' && utools.setSubInput) {
       utools.setSubInput(({ text }) => {
@@ -202,66 +189,40 @@ const App = {
     }
   },
 
-  /**
-   * Remove sub-input.
-   */
   removeSubInput() {
     if (typeof utools !== 'undefined' && utools.removeSubInput) {
       utools.removeSubInput()
     }
   },
 
-  /**
-   * Set the plugin window height.
-   * @param {number} height - pixels, or 'max' for full height
-   */
   setExpendHeight(height) {
     if (typeof utools !== 'undefined' && utools.setExpendHeight) {
       if (height === 'max') {
-        utools.setExpendHeight(0) // 0 = auto/max in some uTools versions
+        utools.setExpendHeight(0)
       } else {
         utools.setExpendHeight(height)
       }
     }
   },
 
-  /**
-   * Redirect to another feature.
-   * @param {string} code - feature code
-   * @param {*} payload - payload to pass
-   */
   redirect(code, payload) {
     if (typeof utools !== 'undefined' && utools.redirect) {
       utools.redirect(code, payload)
     }
   },
 
-  /**
-   * Add a dynamic feature (e.g., quick-access to current session).
-   * @param {string} code
-   * @param {string} explain
-   * @param {string[]} cmds
-   */
   addDynamicFeature(code, explain, cmds) {
     if (typeof utools !== 'undefined' && utools.setFeature) {
       utools.setFeature({ code, explain, cmds })
     }
   },
 
-  /**
-   * Remove a dynamic feature.
-   * @param {string} code
-   */
   removeDynamicFeature(code) {
     if (typeof utools !== 'undefined' && utools.removeFeature) {
       utools.removeFeature(code)
     }
   },
 
-  /**
-   * Take a screenshot and get the base64 image.
-   * @returns {Promise<string|null>}
-   */
   async screenCapture() {
     return new Promise((resolve) => {
       if (typeof utools !== 'undefined' && utools.screenCapture) {
@@ -274,22 +235,12 @@ const App = {
     })
   },
 
-  /**
-   * Paste text to the previously active window.
-   * @param {string} text
-   */
   pasteToPreviousWindow(text) {
     if (typeof utools !== 'undefined' && utools.hideMainWindowPasteText) {
       utools.hideMainWindowPasteText(text)
     }
   },
 
-  /**
-   * Get a setting from uTools dbStorage.
-   * @param {string} key
-   * @param {*} defaultValue
-   * @returns {*}
-   */
   getSetting(key, defaultValue) {
     if (typeof utools !== 'undefined' && utools.dbStorage) {
       const val = utools.dbStorage.getItem(`dsh-setting-${key}`)
@@ -298,20 +249,12 @@ const App = {
     return defaultValue
   },
 
-  /**
-   * Save a setting to uTools dbStorage.
-   * @param {string} key
-   * @param {*} value
-   */
   setSetting(key, value) {
     if (typeof utools !== 'undefined' && utools.dbStorage) {
       utools.dbStorage.setItem(`dsh-setting-${key}`, value)
     }
   },
 
-  /**
-   * Start the uptime display interval.
-   */
   startUptimeDisplay() {
     this.stopUptimeDisplay()
     this.uptimeInterval = setInterval(() => {
@@ -323,9 +266,6 @@ const App = {
     }, 1000)
   },
 
-  /**
-   * Stop the uptime display interval.
-   */
   stopUptimeDisplay() {
     if (this.uptimeInterval) {
       clearInterval(this.uptimeInterval)
@@ -346,35 +286,40 @@ if (typeof utools !== 'undefined') {
   utools.onPluginOut((isKill) => {
     App.stopUptimeDisplay()
     App.removeSubInput()
+    // Unload iframe to stop background requests
+    WebUI.unload()
     if (isKill) {
       const keepRunning = App.getSetting('backgroundRun', false)
       if (!keepRunning) {
+        App.suppressExitView = true
         window.dsh.server.stop()
       }
     }
   })
 
-  // Listen for DSH server process exit — update UI immediately
+  // Listen for DSH server process exit
   window.addEventListener('dsh-server-exited', (e) => {
     App.stopUptimeDisplay()
-    DshUtils.setStatusBadge('stopped', '已停止')
-    // If currently showing Web UI, switch back to server manager
-    const webUIView = document.getElementById('view-web-ui')
-    if (webUIView && webUIView.classList.contains('active')) {
-      DshUtils.showView('view-server-manager')
-      ServerManager.showConfigPanel()
+
+    // If this is an intentional stop/restart, don't switch views
+    if (App.suppressExitView) {
+      App.suppressExitView = false
+      return
     }
+
+    // Unexpected crash — unload and show config panel
+    WebUI.unload()
+    DshUtils.showView('view-server-manager')
+    DshUtils.setStatusBadge('stopped', '已停止')
+    ServerManager.showConfigPanel()
   })
 
-  // Handle detach (separate window)
   if (utools.onPluginDetach) {
     utools.onPluginDetach(() => {
-      // Keep server running when detached
       App.setSetting('backgroundRun', true)
     })
   }
 
-  // Listen for dark mode changes
   if (utools.onThemeChange) {
     utools.onThemeChange(() => {
       DshUtils.applyTheme()

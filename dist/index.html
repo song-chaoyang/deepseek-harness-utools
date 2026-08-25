@@ -20,6 +20,9 @@
           <div class="startup-step" data-step="spawn"><span class="step-icon">○</span><span class="step-label">启动 DSH 进程</span></div>
           <div class="startup-step" data-step="ready"><span class="step-icon">○</span><span class="step-label">等待服务器就绪</span></div>
           <div class="startup-step" data-step="open"><span class="step-icon">○</span><span class="step-label">打开 Web UI</span></div>
+          <div class="loading-progress" style="margin-top:8px;width:100%;max-width:280px;">
+            <div class="loading-progress-bar" id="startup-progress-bar" style="width:0%"></div>
+          </div>
         </div>
         <div class="startup-log" id="startup-log" style="display:none"></div>
       </div>
@@ -118,13 +121,13 @@
 
           <div class="server-actions" style="margin-top:16px">
 
-            <button class="btn btn-primary btn-large" id="btn-start-server">🚀 启动服务器</button>
+            <button class="btn btn-primary btn-large" id="btn-start-server" onclick="ServerManager.startServer()">🚀 启动服务器</button>
 
-            <button class="btn btn-danger btn-large" id="btn-stop-server" style="display:none">⏹ 停止服务器</button>
+            <button class="btn btn-danger btn-large" id="btn-stop-server" style="display:none" onclick="ServerManager.stopServer()">⏹ 停止服务器</button>
 
-            <button class="btn btn-primary" id="btn-open-webui" style="display:none">🌐 打开 Web UI</button>
+            <button class="btn btn-primary" id="btn-open-webui" style="display:none" onclick="WebUI.open()">🌐 打开 Web UI</button>
 
-            <button class="btn btn-secondary" id="btn-restart-server" style="display:none">🔄 重启</button>
+            <button class="btn btn-secondary" id="btn-restart-server" style="display:none" onclick="ServerManager.restartServer()">🔄 重启</button>
 
           </div>
 
@@ -142,7 +145,7 @@
           <p id="error-message" class="error-message"></p>
 
           <div class="error-suggestions" id="error-suggestions"></div>
-          <button class="btn btn-primary" id="btn-retry">重试</button>
+          <button class="btn btn-primary" id="btn-retry" onclick="DshUtils.hideError(); ServerManager.showConfigPanel()">重试</button>
         </div>
       </div>
     </div>
@@ -151,11 +154,11 @@
     <div id="view-web-ui" class="view">
       <div class="web-ui-container">
         <div class="web-ui-toolbar">
-          <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面">←</button>
+          <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面" onclick="DshUtils.showView('view-server-manager'); utools.setExpendHeight(600); ServerManager.showServerInfo()">←</button>
           <span class="web-ui-url" id="web-ui-url-display">http://127.0.0.1:3080</span>
-          <button class="btn btn-icon" id="btn-refresh-webui" title="刷新">↻</button>
-          <button class="btn btn-icon" id="btn-show-logs" title="服务器日志">📋</button>
-          <button class="btn btn-icon" id="btn-open-external" title="在浏览器中打开">↗</button>
+          <button class="btn btn-icon" id="btn-refresh-webui" title="刷新" onclick="WebUI.refresh()">↻</button>
+          <button class="btn btn-icon" id="btn-show-logs" title="服务器日志" onclick="WebUI.toggleLogs()">📋</button>
+          <button class="btn btn-icon" id="btn-open-external" title="在浏览器中打开" onclick="WebUI.openExternal()">↗</button>
         </div>
         <div class="web-ui-loading" id="web-ui-loading">
           <div class="loading-spinner"></div>
@@ -422,8 +425,8 @@
     <div class="log-panel-header">
       <span class="log-panel-title">📋 服务器日志</span>
       <div class="log-panel-actions">
-        <button class="btn btn-sm btn-secondary" id="btn-clear-logs">清空</button>
-        <button class="btn btn-sm btn-secondary" id="btn-close-logs">关闭</button>
+        <button class="btn btn-sm btn-secondary" id="btn-clear-logs" onclick="WebUI.clearLogs()">清空</button>
+        <button class="btn btn-sm btn-secondary" id="btn-close-logs" onclick="WebUI.toggleLogs()">关闭</button>
       </div>
     </div>
     <div class="log-panel-content" id="log-content"></div>

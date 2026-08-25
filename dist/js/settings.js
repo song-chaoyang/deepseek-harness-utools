@@ -618,9 +618,9 @@ const Settings = {
     document.getElementById('setting-telemetry-off')?.addEventListener('change', (e) => {
       App.setSetting('telemetryDisabled', e.target.checked)
       if (e.target.checked) {
-        process.env.DSH_TELEMETRY_DISABLED = '1'
+        App.setSetting('telemetryDisabled', true)
       } else {
-        delete process.env.DSH_TELEMETRY_DISABLED
+        App.setSetting('telemetryDisabled', false)
       }
     })
   },
@@ -817,3 +817,5 @@ const Settings = {
     }
   },
 }
+
+window.Settings = Settings

@@ -309,3 +309,5 @@ const GoalManager = {
     }
   },
 }
+
+window.GoalManager = GoalManager

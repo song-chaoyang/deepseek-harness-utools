@@ -24,7 +24,7 @@ const crypto = require('node:crypto')
 const DEFAULT_PORT = 3080
 const DEFAULT_PROFILE = 'web'
 const HEALTH_CHECK_TIMEOUT = 3000
-const SERVER_READY_TIMEOUT = 60000 // 1 minute (npx cache hit is fast)
+const SERVER_READY_TIMEOUT = 180000 // 3 minutes (first npx install can take a while)
 const HEALTH_CHECK_INTERVAL = 1000
 
 // ============================================================
@@ -103,11 +103,62 @@ function getBundledPaths() {
 }
 
 /**
- * Resolve the best available Node.js: bundled first, then system.
+ * Collect candidate Node.js binary paths from common install locations.
+ *
+ * macOS GUI apps (uTools) inherit PATH from /etc/paths — which does NOT
+ * include nvm (~/.nvm/versions/node/...), ~/.local/bin, or Homebrew on
+ * Apple Silicon.  We probe these locations directly so the plugin works
+ * even when `node` is not on the GUI-inherited PATH.
+ *
+ * @returns {string[]}
+ */
+function discoverNodePaths() {
+  const candidates = []
+  const home = os.homedir()
+  const isWin = process.platform === 'win32'
+  const isMac = process.platform === 'darwin'
+
+  if (isWin) {
+    candidates.push(
+      path.join(home, 'AppData', 'Roaming', 'nvm', 'node.exe'),
+      'C:\\Program Files\\nodejs\\node.exe',
+      'C:\\Program Files (x86)\\nodejs\\node.exe',
+    )
+  } else {
+    // Homebrew
+    candidates.push('/opt/homebrew/bin/node', '/usr/local/bin/node')
+    // nvm: scan all installed versions, pick latest
+    const nvmDir = path.join(home, '.nvm', 'versions', 'node')
+    try {
+      if (fs.existsSync(nvmDir)) {
+        const versions = fs.readdirSync(nvmDir).sort().reverse()
+        for (const v of versions) {
+          candidates.push(path.join(nvmDir, v, 'bin', 'node'))
+        }
+      }
+    } catch { /* ignore */ }
+    // fnm, volta, asdf, n
+    candidates.push(
+      path.join(home, '.local', 'bin', 'node'),         // common manual symlink
+      path.join(home, '.fnm', 'current', 'bin', 'node'),
+      path.join(home, '.volta', 'bin', 'node'),
+      path.join(home, '.asdf', 'shims', 'node'),
+      '/usr/local/n/versions/node/current/bin/node',
+    )
+  }
+
+  // Deduplicate + filter to files that exist
+  return [...new Set(candidates)].filter((p) => {
+    try { return fs.existsSync(p) && fs.statSync(p).isFile() } catch { return false }
+  })
+}
+
+/**
+ * Resolve the best available Node.js: bundled first, then PATH, then discovered.
  * @returns {{ path: string|null, version: string|null, source: 'bundled'|'system'|null }}
  */
 function resolveNode() {
-  // 1. Bundled
+  // 1. Bundled runtime
   const bundled = getBundledNodePath()
   if (bundled) {
     try {
@@ -118,7 +169,8 @@ function resolveNode() {
       }
     } catch { /* broken, fall through */ }
   }
-  // 2. System
+
+  // 2. System PATH (works when launched from a shell-aware environment)
   try {
     const out = execSync('node --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
     const ver = out.trim()
@@ -127,10 +179,20 @@ function resolveNode() {
       const resolved = execSync(`${which} node`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim().split('\n')[0].trim()
       return { path: resolved, version: ver, source: 'system' }
     }
-    return { path: null, version: ver, source: null }
-  } catch {
-    return { path: null, version: null, source: null }
+  } catch { /* not on PATH, try discovered locations */ }
+
+  // 3. Discovered locations (macOS GUI apps don't inherit nvm/homebrew PATH)
+  for (const candidate of discoverNodePaths()) {
+    try {
+      const out = execSync(`"${candidate}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
+      const ver = out.trim()
+      if (versionGte(ver, '24.0.0')) {
+        return { path: candidate, version: ver, source: 'system' }
+      }
+    } catch { /* try next */ }
   }
+
+  return { path: null, version: null, source: null }
 }
 
 /**
@@ -143,31 +205,50 @@ function resolveNpx() {
   const bundled = getBundledPaths()
   if (bundled.node) {
     // Use bundled node directly to run npx-cli.js (avoids .cmd shell issues)
-    // On Windows: node.exe is at <runtime>/node/node.exe, npx-cli.js is at
-    //   <runtime>/node/node_modules/npm/bin/npx-cli.js
-    // On macOS/Linux: node is at <runtime>/node/bin/node, npx-cli.js is at
-    //   <runtime>/node/lib/node_modules/npm/bin/npx-cli.js
-    const nodeDir = path.dirname(bundled.node)   // '.../node' on Win, '.../node/bin' on Unix
-    const parentDir = path.dirname(nodeDir)       // '.../node' on both
-    // Try Windows layout first
+    const nodeDir = path.dirname(bundled.node)
+    const parentDir = path.dirname(nodeDir)
     const npxCliWin = path.join(parentDir, 'node_modules', 'npm', 'bin', 'npx-cli.js')
     if (fs.existsSync(npxCliWin)) {
       return { cmd: bundled.node, preArgs: [npxCliWin], shell: false }
     }
-    // Try macOS/Linux layout
     const npxCliUnix = path.join(parentDir, 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js')
     if (fs.existsSync(npxCliUnix)) {
       return { cmd: bundled.node, preArgs: [npxCliUnix], shell: false }
     }
-    // Fallback: npx.cmd / bin/npx path (requires shell:true)
     if (bundled.npx) {
       return { cmd: bundled.npx, preArgs: [], shell: true }
     }
   }
-  // System npx
+
+  // Try system npx via PATH
   if (hasCommand('npx') || hasCommand('npx.cmd')) {
     return { cmd: process.platform === 'win32' ? 'npx.cmd' : 'npx', preArgs: [], shell: true }
   }
+
+  // Fallback: use discovered Node to run npx-cli.js directly
+  // (macOS GUI apps don't have nvm/homebrew on PATH, but we can find npx-cli.js
+  //  next to the discovered node binary)
+  const nodeInfo = resolveNode()
+  if (nodeInfo.path && nodeInfo.source === 'system') {
+    const nodeBinDir = path.dirname(nodeInfo.path)
+    // npx is typically in the same bin/ directory as node
+    const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+    const npxDirect = path.join(nodeBinDir, npxBin)
+    if (fs.existsSync(npxDirect)) {
+      return { cmd: npxDirect, preArgs: [], shell: true }
+    }
+    // Try npx-cli.js via the discovered node
+    const parentDir = nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir
+    const npxCliWin = path.join(parentDir, 'node_modules', 'npm', 'bin', 'npx-cli.js')
+    if (fs.existsSync(npxCliWin)) {
+      return { cmd: nodeInfo.path, preArgs: [npxCliWin], shell: false }
+    }
+    const npxCliUnix = path.join(parentDir, 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js')
+    if (fs.existsSync(npxCliUnix)) {
+      return { cmd: nodeInfo.path, preArgs: [npxCliUnix], shell: false }
+    }
+  }
+
   return null
 }
 
@@ -196,17 +277,37 @@ function resolveNpm() {
 function resolveGlobalDshBin() {
   const nodeInfo = resolveNode()
   if (!nodeInfo.path) return null
+
+  // 1. Try npm root -g with the resolved node's npm
   try {
+    const nodeBinDir = path.dirname(nodeInfo.path)
     const pathSep = process.platform === 'win32' ? ';' : ':'
     const systemPath = process.env.PATH || process.env.Path || ''
-    const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
-    const out = execSync('npm root -g', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
-    if (!out) return null
-    const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-    return fs.existsSync(bin) ? bin : null
-  } catch {
-    return null
-  }
+    const env = { ...process.env, PATH: nodeBinDir + pathSep + systemPath }
+    // Try npm from same bin/ dir as node
+    const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const npmPath = path.join(nodeBinDir, npmBin)
+    const npmCmd = fs.existsSync(npmPath) ? `"${nodeInfo.path}" "${path.join(nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')}"` : `"${npmBin}"`
+    const out = execSync(`${npmCmd} root -g`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
+    if (out) {
+      const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+      if (fs.existsSync(bin)) return bin
+    }
+  } catch { /* fall through to npx cache */ }
+
+  // 2. Try npx cache — DSH may already be cached from a previous `npx @deepseek-ai/dsh`
+  try {
+    const npxCacheDir = path.join(os.homedir(), '.npm', '_npx')
+    if (fs.existsSync(npxCacheDir)) {
+      const entries = fs.readdirSync(npxCacheDir)
+      for (const entry of entries) {
+        const bin = path.join(npxCacheDir, entry, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+        if (fs.existsSync(bin)) return bin
+      }
+    }
+  } catch { /* ignore */ }
+
+  return null
 }
 
 /**
@@ -635,23 +736,31 @@ window.dsh.env = {
    * @returns {{ installed: boolean, version: string|null, method: string|null }}
    */
   hasDshInstalled() {
-    const npxInfo = resolveNpx()
     const nodeInfo = resolveNode()
+    if (!nodeInfo.path) return { installed: false, version: null, method: null }
 
-    // Build env with bundled node in PATH
+    // Build env with resolved node in PATH
     const pathSep = process.platform === 'win32' ? ';' : ':'
     const systemPath = process.env.PATH || process.env.Path || ''
-    const env = nodeInfo.path
-      ? { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
-      : { ...process.env }
+    const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
 
-    // Check global install (dsh in PATH)
+    // 1. Check npx cache first (fast — no network, no execSync timeout)
+    const globalDshBin = resolveGlobalDshBin()
+    if (globalDshBin) {
+      try {
+        const out = execSync(`"${nodeInfo.path}" "${globalDshBin}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
+        return { installed: true, version: out.trim(), method: 'cache' }
+      } catch { /* try other methods */ }
+    }
+
+    // 2. Check global install (dsh in PATH)
     try {
       const out = execSync('dsh --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000, env })
       return { installed: true, version: out.trim(), method: 'global' }
     } catch { /* not global */ }
 
-    // Check via npx
+    // 3. Check via npx (slow — may download, 30s timeout)
+    const npxInfo = resolveNpx()
     if (npxInfo && nodeInfo.path) {
       try {
         const npxArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'].join(' ')
@@ -757,14 +866,20 @@ window.dsh.server = {
   async start(options = {}) {
     const {
       port = DEFAULT_PORT,
-      workspace = process.cwd(),
+      workspace = null,
       profile = DEFAULT_PROFILE,
       patches = [],
     } = options
 
+    // Resolve workspace: use provided, or saved, or DSH home, or os.homedir()
+    const resolvedWorkspace = workspace
+      || this.getWorkspace()
+      || getDshHome()
+      || os.homedir()
+
     // If already running, check if same config
     if (dshProcess && serverStatus.running) {
-      if (serverStatus.port === port && serverStatus.workspace === workspace) {
+      if (serverStatus.port === port && serverStatus.workspace === resolvedWorkspace) {
         return { success: true, url: `http://127.0.0.1:${port}` }
       }
       await this.stop()
@@ -801,16 +916,12 @@ window.dsh.server = {
     const cmdArgs = globalDshBin ? [globalDshBin] : [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh']
     if (profile === 'web') {
       cmdArgs.push('web')
-      // DSH `web` command opens the default browser by default; we serve the
-      // UI inside the uTools iframe instead, so suppress the external browser.
-      cmdArgs.push('--no-open')
     } else {
       cmdArgs.push('--profile', profile)
     }
 
-    if (port !== DEFAULT_PORT) {
-      cmdArgs.push('--port', String(port))
-    }
+    // Always pass --port so DSH listens on our chosen port
+    cmdArgs.push('--port', String(port))
 
     for (const patch of patches) {
       cmdArgs.push('--patch', patch)
@@ -838,13 +949,13 @@ window.dsh.server = {
       // (shell:false); otherwise spawn npx as before.
       dshProcess = globalDshBin
         ? spawn(nodeInfo.path, cmdArgs, {
-            cwd: workspace || process.cwd(),
+            cwd: resolvedWorkspace,
             env,
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: false,
           })
         : spawn(npxInfo.cmd, cmdArgs, {
-            cwd: workspace || process.cwd(),
+            cwd: resolvedWorkspace,
             env,
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: npxInfo.shell,
@@ -858,7 +969,7 @@ window.dsh.server = {
       port,
       pid: dshProcess.pid,
       startTime: Date.now(),
-      workspace,
+      workspace: resolvedWorkspace,
       profile,
     }
 
@@ -1055,6 +1166,17 @@ window.dsh.server = {
   },
 
   /**
+   * Get the current workspace from uTools dbStorage.
+   * @returns {string|null}
+   */
+  getWorkspace() {
+    if (typeof utools !== 'undefined' && utools.dbStorage) {
+      return utools.dbStorage.getItem('dsh-current-workspace') || null
+    }
+    return null
+  },
+
+  /**
    * Get recent stdout output.
    * @param {number} lines - Number of recent lines
    * @returns {string}
@@ -1070,6 +1192,21 @@ window.dsh.server = {
    */
   getStderr(lines = 50) {
     return stderrBuffer.slice(-lines).join('')
+  },
+
+  /**
+   * Adopt an externally-running DSH server (not started by us).
+   * @param {number} port
+   */
+  adoptExternal(port = DEFAULT_PORT) {
+    serverStatus = {
+      running: true,
+      port,
+      pid: null,
+      startTime: Date.now(),
+      workspace: null,
+      profile: DEFAULT_PROFILE,
+    }
   },
 }
 
@@ -1213,7 +1350,7 @@ window.dsh.config = {
       exec(`"${npxInfo.cmd}" ${args.join(' ')}`, {
         encoding: 'utf8',
         timeout: 30000,
-        cwd: process.cwd(),
+        cwd: getDshHome(),
         env: { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath },
       }, (err, stdout, stderr) => {
         if (err) {
@@ -1329,11 +1466,13 @@ window.dsh.cli = {
    */
   async runHeadless(task, options = {}) {
     const {
-      workspace = process.cwd(),
+      workspace = null,
       model,
       onOutput,
       onError,
     } = options
+
+    const resolvedWorkspace = workspace || window.dsh.workspace.getCurrent() || getDshHome() || os.homedir()
 
     return new Promise((resolve) => {
       const globalDshBin = resolveGlobalDshBin()
@@ -1372,7 +1511,7 @@ window.dsh.cli = {
       let errorOutput = ''
 
       const child = spawn(cmd, cmdArgs, {
-        cwd: workspace,
+        cwd: resolvedWorkspace,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: useShell,
@@ -1451,7 +1590,7 @@ window.dsh.cli = {
       let errorOutput = ''
 
       const child = spawn(cmd, cmdArgs, {
-        cwd: process.cwd(),
+        cwd: getDshHome(),
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: useShell,
@@ -1548,7 +1687,7 @@ window.dsh.cli = {
       }
       // Running npx with the package will trigger install
       const child = spawn(npxInfo.cmd, [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'], {
-        cwd: process.cwd(),
+        cwd: getDshHome(),
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: npxInfo.shell,

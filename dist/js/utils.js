@@ -187,5 +187,8 @@ const DshUtils = {
   },
 }
 
+// 显式挂载到 window，确保 onclick 内联事件能访问
+window.DshUtils = DshUtils
+
 // Apply theme on load
 DshUtils.applyTheme()

@@ -5,6 +5,7 @@ mem-log/
 
 # Editor / tool config
 .atomcode/
+.codely/
 
 # OS
 .DS_Store

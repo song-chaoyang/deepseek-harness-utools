@@ -22,6 +22,24 @@ const WebUI = {
   logCursor: 0,
 
   /**
+   * Clear the iframe to stop it from making requests to a dead server.
+   * Called before stop/restart to prevent ERR_CONNECTION_REFUSED errors.
+   */
+  unload() {
+    const iframe = document.getElementById('dsh-iframe')
+    if (iframe) {
+      iframe.onload = null
+      iframe.src = 'about:blank'
+    }
+    this.loaded = false
+    this.stopReconnect()
+    if (this.loadTimeout) {
+      clearTimeout(this.loadTimeout)
+      this.loadTimeout = null
+    }
+  },
+
+  /**
    * Open the Web UI view.
    */
   open() {
@@ -263,46 +281,21 @@ const WebUI = {
 
   /**
    * Initialize event listeners.
+   * NOTE: All buttons already have onclick="" in HTML.
+   * Do NOT add addEventListener here — it causes duplicate firing.
    */
   init() {
-    const btnBack = document.getElementById('btn-back-to-manager')
-    if (btnBack) {
-      btnBack.addEventListener('click', () => {
-        DshUtils.showView('view-server-manager')
-        if (typeof utools !== 'undefined' && utools.setExpendHeight) {
-          utools.setExpendHeight(600)
-        }
-        ServerManager.showServerInfo()
-      })
-    }
-
-    const btnRefresh = document.getElementById('btn-refresh-webui')
-    if (btnRefresh) {
-      btnRefresh.addEventListener('click', () => this.refresh())
-    }
-
-    const btnExternal = document.getElementById('btn-open-external')
-    if (btnExternal) {
-      btnExternal.addEventListener('click', () => this.openExternal())
-    }
-
-    const btnLogs = document.getElementById('btn-show-logs')
-    if (btnLogs) {
-      btnLogs.addEventListener('click', () => this.toggleLogs())
-    }
-
-    const btnCloseLogs = document.getElementById('btn-close-logs')
-    if (btnCloseLogs) {
-      btnCloseLogs.addEventListener('click', () => this.toggleLogs())
-    }
-
-    const btnClearLogs = document.getElementById('btn-clear-logs')
-    if (btnClearLogs) {
-      btnClearLogs.addEventListener('click', () => this.clearLogs())
-    }
+    // No-op: all button handlers are bound via onclick in index.html
   },
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  WebUI.init()
-})
+;(function () {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => WebUI.init())
+  } else {
+    WebUI.init()
+  }
+})()
+
+// 显式挂载到 window，确保 onclick 内联事件能访问
+window.WebUI = WebUI

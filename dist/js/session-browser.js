@@ -315,3 +315,5 @@ const SessionBrowser = {
     }
   },
 }
+
+window.SessionBrowser = SessionBrowser

@@ -16,6 +16,8 @@ const os = require('node:os')
 const http = require('node:http')
 const https = require('node:https')
 const crypto = require('node:crypto')
+const net = require('node:net')
+const zlib = require('node:zlib')
 
 // ============================================================
 //  Constants
@@ -43,6 +45,11 @@ let serverStatus = {
 
 let stdoutBuffer = []
 let stderrBuffer = []
+
+// Link-bridge proxy state (see startBridge / stopBridge below)
+let bridgeServer = null
+let bridgeTargetPort = null
+let bridgeListenPort = null
 
 // ============================================================
 //  Utilities
@@ -696,6 +703,297 @@ function httpRequest(method, urlPath, body = null, port = serverStatus.port) {
 }
 
 // ============================================================
+//  Link Bridge — local reverse proxy that injects an external-link
+//  interceptor into the DSH Web UI HTML.
+//
+//  WHY: the DSH web UI is loaded in a cross-origin iframe
+//  (http://127.0.0.1:<port>) inside the uTools plugin page, so the
+//  parent page cannot inject scripts into it, and uTools' preload
+//  environment does not expose @electron/remote / electron.remote,
+//  so setWindowOpenHandler-based interception silently fails.
+//
+//  SOLUTION: a tiny local reverse proxy listens on the configured
+//  port, forwards everything to the real DSH server (which runs on
+//  a free port), and injects <script src="/__dsh_link_bridge.js">
+//  into text/html responses. The bridge script intercepts clicks on
+//  external links / target=_blank and posts a message to the parent
+//  page, which calls utools.shellOpenExternal().
+// ============================================================
+
+/**
+ * Small bridge script served at /__dsh_link_bridge.js inside the
+ * DSH iframe. Intercepts external-link clicks and window.open(),
+ * forwarding the URL to the parent page via postMessage.
+ */
+const LINK_BRIDGE_SCRIPT = `;(function () {
+  if (window.__dshLinkBridgeInstalled) return
+  window.__dshLinkBridgeInstalled = true
+  var origin = window.location.origin
+
+  function openExternal(url) {
+    if (!url) return
+    try {
+      window.parent.postMessage({ type: 'dsh-open-external', url: String(url) }, '*')
+    } catch (e) {}
+  }
+
+  // Capture clicks on <a> tags (capture phase, before the SPA handles them)
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null
+    if (!a || !a.href) return
+    var href = a.href
+    var target = a.target || ''
+    var external = href.indexOf(origin) !== 0 &&
+      href.indexOf('about:') !== 0 &&
+      href.indexOf('javascript:') !== 0 &&
+      href.indexOf('data:') !== 0
+    // target=_blank or links pointing outside the DSH origin → system browser
+    if (target === '_blank' || target === '_new' || external) {
+      e.preventDefault()
+      e.stopPropagation()
+      openExternal(href)
+      return false
+    }
+  }, true)
+
+  // window.open() calls (e.g. JS-driven popups) → system browser
+  var nativeOpen = window.open
+  if (nativeOpen) {
+    window.open = function (url) {
+      if (url && typeof url === 'string' && url.indexOf('about:') !== 0) {
+        openExternal(url)
+      }
+      return null
+    }
+  }
+
+  // Right-click anywhere in the DSH page → tell the parent to show a
+  // context menu. Keep native menu inside editable fields (copy/paste).
+  document.addEventListener('contextmenu', function (e) {
+    var t = e.target
+    var editable = t && (
+      t.tagName === 'INPUT' ||
+      t.tagName === 'TEXTAREA' ||
+      t.tagName === 'SELECT' ||
+      t.isContentEditable
+    )
+    if (editable) return
+    var a = t && t.closest ? t.closest('a[href]') : null
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      window.parent.postMessage({
+        type: 'dsh-context-link',
+        url: a && a.href ? String(a.href) : '',
+        clientX: e.clientX || 0,
+        clientY: e.clientY || 0,
+      }, '*')
+    } catch (err) {}
+  }, true)
+})()`
+
+/**
+ * Start the link-bridge proxy on `listenPort`, forwarding all
+ * requests to the real DSH server on `targetPort`.
+ * @param {number} listenPort - Port the iframe/UI connects to (configured port)
+ * @param {number} targetPort - Port the actual DSH server listens on
+ * @returns {Promise<number>} The bound port
+ */
+function startBridge(listenPort, targetPort) {
+  return new Promise((resolve, reject) => {
+    stopBridge()
+    bridgeTargetPort = targetPort
+
+    const server = http.createServer((req, res) => {
+      // Serve the bridge script itself (same-origin with the DSH page)
+      if (req.url === '/__dsh_link_bridge.js') {
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Cache-Control': 'no-store',
+        })
+        res.end(LINK_BRIDGE_SCRIPT)
+        return
+      }
+      bridgeProxyRequest(req, res)
+    })
+
+    server.on('upgrade', (req, socket, head) => bridgeProxyUpgrade(req, socket, head))
+
+    server.on('error', (err) => {
+      stopBridge()
+      reject(err)
+    })
+
+    server.listen(listenPort, '127.0.0.1', () => {
+      bridgeServer = server
+      bridgeListenPort = server.address().port
+      console.log(`[dsh] link bridge listening on 127.0.0.1:${bridgeListenPort} → 127.0.0.1:${targetPort}`)
+      resolve(server.address().port)
+    })
+  })
+}
+
+/**
+ * Stop the link-bridge proxy.
+ */
+function stopBridge() {
+  if (bridgeServer) {
+    try { bridgeServer.close() } catch { /* ignore */ }
+    bridgeServer = null
+  }
+  bridgeTargetPort = null
+  bridgeListenPort = null
+}
+
+/**
+ * Rewrite forwarded request headers so the DSH server sees a consistent
+ * same-origin request. DSH's isTrustedApiRequest() rejects (403) any
+ * /api request whose Origin host does not match the Host header, so we
+ * must rewrite Host, Origin and Referer to the DSH's own origin.
+ * @param {object} headers - Incoming (browser) request headers
+ * @returns {object} New headers object safe to forward to the DSH server
+ */
+function rewriteBridgeHeaders(headers) {
+  const out = { ...headers }
+  const targetOrigin = `http://127.0.0.1:${bridgeTargetPort}`
+  out.host = `127.0.0.1:${bridgeTargetPort}`
+  if (out.origin) out.origin = targetOrigin
+  if (out.referer) {
+    out.referer = String(out.referer).replace(/^https?:\/\/[^/]+/, targetOrigin)
+  }
+  // Force identity encoding so HTML can be rewritten before forwarding
+  delete out['accept-encoding']
+  return out
+}
+
+/**
+ * Rewrite response headers coming back from the DSH server so the
+ * browser (whose page origin is the bridge port, not the DSH port)
+ * does not reject them. CORS headers emitted by DSH point at its own
+ * origin; we retarget them at the bridge origin the iframe lives on.
+ * @param {object} headers - Response headers from the DSH server
+ * @returns {object} New headers object safe to send to the browser
+ */
+function rewriteBridgeResponseHeaders(headers) {
+  const out = { ...headers }
+  const bridgeOrigin = bridgeListenPort ? `http://127.0.0.1:${bridgeListenPort}` : null
+  if (!bridgeOrigin) return out
+  // Retarget CORS headers at the bridge origin (the page's own origin)
+  if (out['access-control-allow-origin']) {
+    out['access-control-allow-origin'] = bridgeOrigin
+  }
+  // Access-Control-Allow-Origin with credentials must not be '*'
+  if (out['access-control-allow-credentials'] === 'true' ||
+      String(out['access-control-allow-credentials'] || '').toLowerCase() === 'true') {
+    out['access-control-allow-origin'] = bridgeOrigin
+  }
+  return out
+}
+
+/**
+ * Forward a normal HTTP request to the DSH server, injecting the
+ * bridge script into text/html responses.
+ */
+function bridgeProxyRequest(req, res) {
+  if (!bridgeTargetPort) {
+    res.writeHead(502)
+    res.end()
+    return
+  }
+  const headers = rewriteBridgeHeaders(req.headers)
+
+  const proxyReq = http.request({
+    hostname: '127.0.0.1',
+    port: bridgeTargetPort,
+    path: req.url,
+    method: req.method,
+    headers,
+  }, (proxyRes) => {
+    const ct = String(proxyRes.headers['content-type'] || '').toLowerCase()
+    const isHtml = ct.includes('text/html')
+    if (!isHtml) {
+      res.writeHead(proxyRes.statusCode, rewriteBridgeResponseHeaders(proxyRes.headers))
+      proxyRes.pipe(res)
+      return
+    }
+
+    // Buffer the HTML, inject the bridge script, then forward
+    const chunks = []
+    proxyRes.on('data', (c) => chunks.push(c))
+    proxyRes.on('end', () => {
+      let buf = Buffer.concat(chunks)
+      const enc = String(proxyRes.headers['content-encoding'] || '').toLowerCase()
+
+      const finish = (htmlBuf) => {
+        let html = htmlBuf.toString('utf8')
+        const tag = '<script src="/__dsh_link_bridge.js"></script>'
+        // Strip any CSP meta tags so the injected script is allowed to run
+        html = html.replace(/<meta[^>]*http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi, '')
+        if (/<\/head>/i.test(html)) {
+          html = html.replace(/<\/head>/i, tag + '</head>')
+        } else if (/<body[^>]*>/i.test(html)) {
+          html = html.replace(/<body[^>]*>/i, (m) => m + tag)
+        } else {
+          html = tag + html
+        }
+        const outHeaders = rewriteBridgeResponseHeaders(proxyRes.headers)
+        delete outHeaders['content-length']
+        delete outHeaders['content-encoding']
+        delete outHeaders['content-security-policy']
+        outHeaders['cache-control'] = 'no-store'
+        console.log(`[dsh] bridge: injected link interceptor into ${req.url} (${html.length} bytes)`)
+        res.writeHead(proxyRes.statusCode, outHeaders)
+        res.end(html)
+      }
+
+      if (enc === 'gzip') {
+        zlib.gunzip(buf, (err, out) => finish(err ? buf : out))
+      } else if (enc === 'deflate') {
+        zlib.inflate(buf, (err, out) => finish(err ? buf : out))
+      } else if (enc === 'br') {
+        zlib.brotliDecompress(buf, (err, out) => finish(err ? buf : out))
+      } else {
+        finish(buf)
+      }
+    })
+    proxyRes.on('error', () => { try { res.end() } catch { /* ignore */ } })
+  })
+
+  proxyReq.on('error', () => {
+    try { res.writeHead(502); res.end() } catch { /* ignore */ }
+  })
+  req.pipe(proxyReq)
+}
+
+/**
+ * Forward a WebSocket upgrade to the DSH server (raw TCP tunnel).
+ */
+function bridgeProxyUpgrade(req, socket, head) {
+  if (!bridgeTargetPort) {
+    socket.destroy()
+    return
+  }
+  const dest = net.connect(bridgeTargetPort, '127.0.0.1', () => {
+    const headers = rewriteBridgeHeaders(req.headers)
+    let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`
+    for (const [k, v] of Object.entries(headers)) {
+      if (Array.isArray(v)) {
+        for (const vv of v) raw += `${k}: ${vv}\r\n`
+      } else if (v !== undefined) {
+        raw += `${k}: ${v}\r\n`
+      }
+    }
+    raw += '\r\n'
+    dest.write(raw)
+    if (head && head.length) dest.write(head)
+    socket.pipe(dest)
+    dest.pipe(socket)
+  })
+  dest.on('error', () => socket.destroy())
+  socket.on('error', () => dest.destroy())
+}
+
+// ============================================================
 //  window.dsh — Public API
 // ============================================================
 
@@ -880,7 +1178,15 @@ window.dsh.server = {
     // If already running, check if same config
     if (dshProcess && serverStatus.running) {
       if (serverStatus.port === port && serverStatus.workspace === resolvedWorkspace) {
-        return { success: true, url: `http://127.0.0.1:${port}` }
+        // Ensure the bridge is still up (it may have been stopped)
+        if (!bridgeServer) {
+          try {
+            await startBridge(0, serverStatus.dshPort || port)
+          } catch (err) {
+            console.warn('[dsh] bridge re-start failed:', err.message)
+          }
+        }
+        return { success: true, url: this.getServerUrl() }
       }
       await this.stop()
     }
@@ -891,6 +1197,21 @@ window.dsh.server = {
 
     // Yield before synchronous execSync calls to let UI render
     await new Promise(r => setTimeout(r, 0))
+
+    // If the configured port already has a healthy DSH service running
+    // (e.g. a leftover process from a previous session, or an externally
+    // started server), adopt it instead of spawning a new one — spawning
+    // would fail with EADDRINUSE and leave the user with a confusing error.
+    try {
+      const probeHealthy = await this.probePort(port)
+      if (probeHealthy) {
+        console.log(`[dsh] port ${port} already serves DSH — adopting existing server`)
+        await this.adoptExternal(port)
+        return { success: true, url: this.getServerUrl() }
+      }
+    } catch {
+      // probe failed — fall through to normal startup
+    }
 
     // Determine the command to run — prefer the globally-installed DSH CLI
     // (fast: no npx registry round-trip), falling back to npx when missing.
@@ -912,6 +1233,17 @@ window.dsh.server = {
       }
     }
 
+    // Link bridge: the bridge listens on a RANDOM free port and forwards
+    // to the DSH server on the configured port. The iframe connects to the
+    // bridge URL (getServerUrl) so it receives the injected link
+    // interceptor. The bridge is best-effort — if it fails to start, the
+    // server still runs (links just won't auto-open in the system browser).
+    try {
+      await startBridge(0, port)
+    } catch (err) {
+      console.warn('[dsh] link bridge failed to start (non-fatal):', err.message)
+    }
+
     // Build command arguments
     const cmdArgs = globalDshBin ? [globalDshBin] : [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh']
     if (profile === 'web') {
@@ -920,7 +1252,7 @@ window.dsh.server = {
       cmdArgs.push('--profile', profile)
     }
 
-    // Always pass --port so DSH listens on our chosen port
+    // DSH listens on the configured port; the bridge (random port) forwards to it
     cmdArgs.push('--port', String(port))
 
     for (const patch of patches) {
@@ -942,6 +1274,28 @@ window.dsh.server = {
     // Windows needs ComSpec for .cmd/.bat execution
     if (process.platform === 'win32' && !env.ComSpec) {
       env.ComSpec = process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe'
+    }
+
+    // Inject the AbortSignal.any polyfill (if present) into the spawned DSH
+    // server process. The uTools embedded runtime / older Node versions do not
+    // implement AbortSignal.any(), which many DSH dependencies rely on, causing
+    // "AbortSignal.any is not a function (internal)" when sending messages.
+    // NODE_OPTIONS=--require is inherited by both the global-DSH and the npx path.
+    try {
+      const polyfillPath = path.join(__dirname, 'polyfills', 'abort-signal-any.js')
+      if (fs.existsSync(polyfillPath)) {
+        const existing = env.NODE_OPTIONS || ''
+        // NODE_OPTIONS is a space-separated token list, so quote the path —
+        // otherwise install paths containing spaces (e.g. Windows user
+        // directories) would be split into invalid tokens and abort startup.
+        const requireOpt = polyfillPath.includes(' ')
+          ? `--require="${polyfillPath}"`
+          : `--require=${polyfillPath}`
+        env.NODE_OPTIONS = (existing ? existing + ' ' : '') + requireOpt
+      }
+    } catch (polyfillErr) {
+      // Non-fatal: if the polyfill cannot be injected, let the server start anyway.
+      console.warn('[dsh] failed to inject AbortSignal.any polyfill:', polyfillErr.message)
     }
 
     try {
@@ -967,6 +1321,7 @@ window.dsh.server = {
     serverStatus = {
       running: true,
       port,
+      dshPort: port,
       pid: dshProcess.pid,
       startTime: Date.now(),
       workspace: resolvedWorkspace,
@@ -977,20 +1332,21 @@ window.dsh.server = {
     dshProcess.stdout.on('data', (data) => {
       const text = data.toString()
       stdoutBuffer.push(text)
-      if (stdoutBuffer.length > 500) stdoutBuffer.shift()
+      if (stdoutBuffer.length > 2000) stdoutBuffer.shift()
     })
 
     // Capture stderr for debugging
     dshProcess.stderr.on('data', (data) => {
       const text = data.toString()
       stderrBuffer.push(text)
-      if (stderrBuffer.length > 500) stderrBuffer.shift()
+      if (stderrBuffer.length > 2000) stderrBuffer.shift()
     })
 
     // Handle process exit
     dshProcess.on('exit', (code) => {
       serverStatus.running = false
       serverStatus.pid = null
+      stopBridge()
       console.log(`[dsh] server process exited (code=${code})`)
       // Broadcast a custom event so the UI layer can react
       try {
@@ -1007,7 +1363,7 @@ window.dsh.server = {
     // Wait for the server to be ready
     try {
       await this.waitForReady(SERVER_READY_TIMEOUT)
-      return { success: true, url: `http://127.0.0.1:${port}` }
+      return { success: true, url: this.getServerUrl() }
     } catch (err) {
       const stderr = stderrBuffer.join('')
       const stdout = stdoutBuffer.join('')
@@ -1046,6 +1402,7 @@ window.dsh.server = {
    * @returns {Promise<{ success: boolean }>}
    */
   async stop() {
+    stopBridge()
     if (!dshProcess) return { success: true }
 
     return new Promise((resolve) => {
@@ -1134,6 +1491,37 @@ window.dsh.server = {
   },
 
   /**
+   * Probe an arbitrary port for a running HTTP service (used before
+   * starting the server to detect leftover/external DSH instances).
+   * @param {number} port
+   * @returns {Promise<boolean>}
+   */
+  async probePort(port) {
+    try {
+      // Probe a DSH RPC endpoint and validate the response envelope, so we
+      // only adopt a real DSH server — not any unrelated HTTP service that
+      // happens to be listening on the configured port.
+      const result = await httpRequest(
+        'POST',
+        '/api/session/list',
+        {
+          type: 'client-request',
+          rpcId: String(Date.now()),
+          method: 'session/list',
+          payload: { args: {} },
+        },
+        port,
+      )
+      if (result.statusCode >= 400) return false
+      const d = result.data
+      return !!(d && d.result &&
+        (d.result.ok !== undefined || d.result.value !== undefined || d.result.error !== undefined))
+    } catch {
+      return false
+    }
+  },
+
+  /**
    * Wait for the DSH server to become ready.
    * @param {number} timeout - Maximum wait in milliseconds
    * @returns {Promise<boolean>}
@@ -1158,10 +1546,25 @@ window.dsh.server = {
   },
 
   /**
-   * Get the server URL.
+   * Get the server URL. If the link bridge is running, returns the
+   * bridge URL (which is where the iframe must connect to get the
+   * injected link interceptor); otherwise returns the direct DSH URL.
    * @returns {string}
    */
   getServerUrl() {
+    if (bridgeListenPort) {
+      return `http://127.0.0.1:${bridgeListenPort}`
+    }
+    return `http://127.0.0.1:${serverStatus.port}`
+  },
+
+  /**
+   * Get the direct DSH server URL (the configured port, without the
+   * bridge). Use this for display, copy, and opening in an external
+   * browser — it is the stable address the user expects to see.
+   * @returns {string}
+   */
+  getDirectUrl() {
     return `http://127.0.0.1:${serverStatus.port}`
   },
 
@@ -1181,7 +1584,7 @@ window.dsh.server = {
    * @param {number} lines - Number of recent lines
    * @returns {string}
    */
-  getStdout(lines = 50) {
+  getStdout(lines = 500) {
     return stdoutBuffer.slice(-lines).join('')
   },
 
@@ -1190,22 +1593,34 @@ window.dsh.server = {
    * @param {number} lines - Number of recent lines
    * @returns {string}
    */
-  getStderr(lines = 50) {
+  getStderr(lines = 500) {
     return stderrBuffer.slice(-lines).join('')
   },
 
   /**
    * Adopt an externally-running DSH server (not started by us).
+   * Starts the link bridge on a random port so the iframe still gets
+   * the injected link interceptor even for external/leftover servers.
    * @param {number} port
    */
-  adoptExternal(port = DEFAULT_PORT) {
+  async adoptExternal(port = DEFAULT_PORT) {
     serverStatus = {
       running: true,
       port,
+      dshPort: port,
       pid: null,
       startTime: Date.now(),
       workspace: null,
       profile: DEFAULT_PROFILE,
+    }
+    // The external DSH already occupies `port`, so the bridge listens on
+    // a random port and forwards to it. getServerUrl() then returns the
+    // bridge URL so the iframe is guaranteed to get the injected script.
+    try {
+      await startBridge(0, port)
+      console.log(`[dsh] adoptExternal: bridge ready at 127.0.0.1:${bridgeListenPort}`)
+    } catch (err) {
+      console.warn('[dsh] adoptExternal: bridge failed to start:', err.message)
     }
   },
 }
@@ -1362,6 +1777,127 @@ window.dsh.config = {
     })
   },
 }
+
+// ------------------------------------------------------------
+//  openExternal — Open a URL in the system's default browser
+// ------------------------------------------------------------
+
+/**
+ * Open a URL in the system's default browser.
+ * @param {string} url
+ */
+// Dedup guard: one link click can reach openExternal from 2-3 layers at once
+// (setWindowOpenHandler, legacy 'new-window', and the caller in web-ui.js).
+// Collapse identical URLs that arrive within a short window to a single open.
+window.dsh.__lastExternalOpenUrl = null
+window.dsh.__lastExternalOpenTime = 0
+
+window.dsh.openExternal = function (url) {
+  const now = Date.now()
+  if (url && url === window.dsh.__lastExternalOpenUrl && now - window.dsh.__lastExternalOpenTime < 1000) {
+    return
+  }
+  window.dsh.__lastExternalOpenUrl = url
+  window.dsh.__lastExternalOpenTime = now
+
+  if (typeof utools !== 'undefined' && utools.shellOpenExternal) {
+    utools.shellOpenExternal(url)
+  } else {
+    try {
+      const { shell } = require('electron')
+      if (shell && shell.openExternal) shell.openExternal(url)
+    } catch (e) {
+      console.error('Cannot open URL externally:', url, e)
+    }
+  }
+}
+
+// ------------------------------------------------------------
+//  Intercept new-window / window.open from cross-origin iframes
+//  so links open in the system browser, not new Electron windows.
+// ------------------------------------------------------------
+
+;(function setupIframeLinkInterception() {
+  /**
+   * Attach a window-open handler to a webContents.
+   * Catches window.open(), target="_blank", and middle-click-new-tab
+   * from the DSH iframe (which is cross-origin, so JS injection fails).
+   */
+  function hookWebContents(wc) {
+    if (!wc || wc.__dshHooked) return
+    wc.__dshHooked = true
+
+    // Electron ≥ 15: setWindowOpenHandler
+    if (typeof wc.setWindowOpenHandler === 'function') {
+      wc.setWindowOpenHandler(({ url }) => {
+        if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) {
+          window.dsh.openExternal(url)
+        }
+        return { action: 'deny' }
+      })
+      console.log('[dsh] webContents.setWindowOpenHandler attached')
+    }
+
+    // Legacy: 'new-window' event (Electron < 15)
+    if (typeof wc.on === 'function') {
+      wc.on('new-window', (event, url) => {
+        if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) {
+          event.preventDefault()
+          window.dsh.openExternal(url)
+        }
+      })
+      console.log('[dsh] webContents new-window listener attached')
+    }
+  }
+
+  // Method 1: Try via @electron/remote (uTools uses this internally)
+  try {
+    const remote = require('@electron/remote') || require('electron').remote
+    if (remote && remote.getCurrentWindow) {
+      const win = remote.getCurrentWindow()
+      hookWebContents(win.webContents)
+    }
+  } catch (e) {
+    // remote not available — try other methods
+  }
+
+  // Method 2: Poll for iframe webContents via webFrame
+  // The iframe's webContents appears as a child; we hook it when the
+  // iframe is created (on WebUI.load). We expose a helper for JS to call.
+  window.dsh.hookIframeLinks = function () {
+    try {
+      const remote = require('@electron/remote') || require('electron').remote
+      if (remote && remote.getCurrentWindow) {
+        const win = remote.getCurrentWindow()
+        if (win.webContents) {
+          // Hook the host webContents plus any child webContents (iframes)
+          hookWebContents(win.webContents)
+          if (typeof win.webContents.getAllWebContents === 'function') {
+            for (const wc of win.webContents.getAllWebContents()) {
+              hookWebContents(wc)
+            }
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Method 3: Re-hook after a delay (iframe may be created later)
+  setTimeout(() => {
+    try {
+      const remote = require('@electron/remote') || require('electron').remote
+      if (remote && remote.getCurrentWindow) {
+        const win = remote.getCurrentWindow()
+        // Also hook child webContents (iframes)
+        if (win.webContents && win.webContents.getAllWebContents) {
+          for (const wc of win.webContents.getAllWebContents()) {
+            hookWebContents(wc)
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }, 3000)
+})()
 
 // ------------------------------------------------------------
 //  workspace — Workspace management
@@ -1838,6 +2374,9 @@ window.dsh.api = {
 
     /** Cancel the current agent turn. */
     async cancel(sessionId) { return rpc('session.cancel', { sessionId }) },
+
+    /** Delete a session. */
+    async delete(sessionId) { return rpc('session.delete', { sessionId }) },
   },
 
   // ----------------------------------------------------------
@@ -2416,7 +2955,7 @@ if (typeof utools !== 'undefined' && utools.registerTool) {
     const status = window.dsh.server.getStatus()
     return {
       running: status.running,
-      url: window.dsh.server.getServerUrl(),
+      url: window.dsh.server.getDirectUrl(),
       port: status.port,
       pid: status.pid,
       uptime: status.uptime,

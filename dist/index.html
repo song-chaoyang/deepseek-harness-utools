@@ -156,8 +156,8 @@
         <div class="web-ui-toolbar">
           <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面" onclick="DshUtils.showView('view-server-manager'); utools.setExpendHeight(600); ServerManager.showServerInfo()">←</button>
           <span class="web-ui-url" id="web-ui-url-display">http://127.0.0.1:3080</span>
-          <button class="btn btn-icon" id="btn-refresh-webui" title="刷新" onclick="WebUI.refresh()">↻</button>
-          <button class="btn btn-icon" id="btn-show-logs" title="服务器日志" onclick="WebUI.toggleLogs()">📋</button>
+          <button class="btn btn-icon" id="btn-refresh-webui" title="刷新 (Ctrl+R)" onclick="WebUI.refresh()">↻</button>
+          <button class="btn btn-icon" id="btn-show-logs" title="服务器日志 (Ctrl+L)" onclick="WebUI.toggleLogs()">🖥️</button>
           <button class="btn btn-icon" id="btn-open-external" title="在浏览器中打开" onclick="WebUI.openExternal()">↗</button>
         </div>
         <div class="web-ui-loading" id="web-ui-loading">
@@ -423,7 +423,7 @@
   <!-- 日志面板 -->
   <div class="log-panel" id="log-panel">
     <div class="log-panel-header">
-      <span class="log-panel-title">📋 服务器日志</span>
+      <span class="log-panel-title">🖥️ 服务器日志</span>
       <div class="log-panel-actions">
         <button class="btn btn-sm btn-secondary" id="btn-clear-logs" onclick="WebUI.clearLogs()">清空</button>
         <button class="btn btn-sm btn-secondary" id="btn-close-logs" onclick="WebUI.toggleLogs()">关闭</button>
@@ -431,6 +431,9 @@
     </div>
     <div class="log-panel-content" id="log-content"></div>
   </div>
+
+  <!-- 通用右键菜单 -->
+  <div id="context-menu" class="context-menu" style="display:none"></div>
 
   <script src="js/utils.js"></script>
   <script src="js/server-manager.js"></script>

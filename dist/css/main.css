@@ -949,7 +949,7 @@ body {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 240px;
+  height: 360px;
   background: var(--color-bg);
   border-top: 2px solid var(--color-primary);
   display: none;
@@ -999,6 +999,128 @@ body {
 
 .log-panel-content .log-warn {
   color: var(--color-warning);
+}
+
+/* ===== Context Menu ===== */
+.context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 180px;
+  max-width: 260px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 4px;
+  user-select: none;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--color-text);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.context-menu-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.context-menu-item .cm-icon {
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.context-menu-item .cm-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.context-menu-item .cm-shortcut {
+  flex: none;
+  margin-left: 16px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  opacity: 0.7;
+}
+
+.context-menu-item.disabled {
+  color: var(--color-text-secondary);
+  cursor: default;
+}
+
+.context-menu-item.disabled:hover {
+  background: transparent;
+}
+
+.context-menu-sep {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 6px;
+}
+
+/* Group / section header (non-clickable) */
+.context-menu-header {
+  padding: 6px 10px 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  cursor: default;
+  user-select: none;
+}
+
+/* Group header that is not the first row gets extra top margin */
+.context-menu-header + .context-menu-header {
+  margin-top: 2px;
+}
+
+/* Keyboard-focused active row */
+.context-menu-item.active,
+.context-menu-item.active:hover {
+  background: var(--color-primary-light);
+}
+
+/* Destructive action (e.g. delete) */
+.context-menu-item.danger .cm-label {
+  color: var(--color-danger);
+}
+.context-menu-item.danger .cm-icon {
+  color: var(--color-danger);
+}
+
+/* Checked state (toggleable actions) */
+.context-menu-item.checked .cm-check {
+  display: inline;
+  color: var(--color-primary);
+  font-weight: 700;
+}
+.context-menu-item .cm-check {
+  display: none;
+  flex: none;
+  margin-left: 12px;
+  font-size: 13px;
+}
+
+/* Secondary subtitle line under a label */
+.context-menu-item .cm-subtitle {
+  display: block;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ===== Quick Command Templates ===== */

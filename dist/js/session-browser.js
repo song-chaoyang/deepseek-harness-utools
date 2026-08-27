@@ -134,6 +134,82 @@ const SessionBrowser = {
         const sessionId = item.dataset.sessionId
         if (sessionId) this.showDetail(sessionId)
       })
+
+      // Right-click a session item → context menu with common actions
+      item.addEventListener('contextmenu', (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        const sessionId = item.dataset.sessionId
+        if (!sessionId) return
+        // Anchor the current-session actions (Fork/取消/截图/导出/Web UI)
+        // to the right-clicked item instead of the last-opened session
+        this.currentSessionId = sessionId
+        const session = this.filtered.find(
+          (s) => (s.sessionId || s.id) === sessionId,
+        )
+        const isRunning = session && session.running === true
+        const title = session ? (session.title || session.id || '未命名会话') : sessionId
+
+        DshUtils.showContextMenu(e.clientX, e.clientY, [
+          {
+            icon: '👁',
+            label: '查看详情',
+            action: () => this.showDetail(sessionId),
+          },
+          {
+            icon: '🖥',
+            label: '在 Web UI 中打开',
+            action: () => this.resumeCurrent(),
+          },
+          {
+            separator: true,
+          },
+          {
+            icon: '🔀',
+            label: 'Fork 会话',
+            action: () => this.forkCurrent(),
+          },
+          {
+            icon: '⛔',
+            label: '取消 Agent',
+            disabled: !isRunning,
+            action: () => this.cancelCurrent(),
+          },
+          {
+            icon: '📷',
+            label: '截图发送',
+            action: () => this.sendScreenshot(),
+          },
+          {
+            separator: true,
+          },
+          {
+            icon: '📤',
+            label: '导出会话',
+            action: () => this.exportCurrent(),
+          },
+          {
+            icon: '📋',
+            label: '复制会话 ID',
+            action: () => {
+              DshUtils.copyToClipboard(sessionId)
+              DshUtils.notify('已复制会话 ID')
+            },
+          },
+          {
+            separator: true,
+          },
+          {
+            icon: '🗑',
+            label: '删除会话',
+            action: () => {
+              if (confirm(`确定要删除会话「${title}」吗？此操作不可撤销。`)) {
+                this.deleteSession(sessionId)
+              }
+            },
+          },
+        ])
+      })
     })
   },
 
@@ -312,6 +388,23 @@ const SessionBrowser = {
       DshUtils.notify('会话数据已复制到剪贴板')
     } catch (err) {
       DshUtils.notify('导出失败: ' + err.message)
+    }
+  },
+
+  /**
+   * Delete a session by ID.
+   * @param {string} sessionId
+   */
+  async deleteSession(sessionId) {
+    try {
+      await window.dsh.api.session.delete(sessionId)
+      DshUtils.notify('会话已删除')
+      // Remove from local lists
+      this.sessions = this.sessions.filter((s) => (s.sessionId || s.id) !== sessionId)
+      this.filtered = this.filtered.filter((s) => (s.sessionId || s.id) !== sessionId)
+      this.render()
+    } catch (err) {
+      DshUtils.notify('删除失败: ' + err.message)
     }
   },
 }

@@ -98,7 +98,7 @@ window.App = {
 
     if (existing.healthy) {
       const port = this.getSetting('port', 3080)
-      window.dsh.server.adoptExternal(port)
+      await window.dsh.server.adoptExternal(port)
       ServerManager.showServerInfo()
       this.setExpendHeight(800)
       WebUI.open()

@@ -261,7 +261,8 @@ const ServerManager = {
       infoSection.style.display = 'block'
       document.getElementById('info-status').textContent = isRunning ? '运行中' : '已停止'
       document.getElementById('info-status').style.color = isRunning ? 'var(--color-success)' : 'var(--color-danger)'
-      document.getElementById('info-url').textContent = window.dsh.server.getServerUrl()
+      document.getElementById('info-url').textContent = window.dsh.server.getDirectUrl()
+        || window.dsh.server.getServerUrl()
       document.getElementById('info-pid').textContent = status.pid || '外部'
       document.getElementById('info-uptime').textContent = DshUtils.formatUptime(status.uptime)
     }

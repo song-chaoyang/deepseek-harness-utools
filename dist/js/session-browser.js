@@ -196,18 +196,6 @@ const SessionBrowser = {
               DshUtils.notify('已复制会话 ID')
             },
           },
-          {
-            separator: true,
-          },
-          {
-            icon: '🗑',
-            label: '删除会话',
-            action: () => {
-              if (confirm(`确定要删除会话「${title}」吗？此操作不可撤销。`)) {
-                this.deleteSession(sessionId)
-              }
-            },
-          },
         ])
       })
     })
@@ -388,23 +376,6 @@ const SessionBrowser = {
       DshUtils.notify('会话数据已复制到剪贴板')
     } catch (err) {
       DshUtils.notify('导出失败: ' + err.message)
-    }
-  },
-
-  /**
-   * Delete a session by ID.
-   * @param {string} sessionId
-   */
-  async deleteSession(sessionId) {
-    try {
-      await window.dsh.api.session.delete(sessionId)
-      DshUtils.notify('会话已删除')
-      // Remove from local lists
-      this.sessions = this.sessions.filter((s) => (s.sessionId || s.id) !== sessionId)
-      this.filtered = this.filtered.filter((s) => (s.sessionId || s.id) !== sessionId)
-      this.render()
-    } catch (err) {
-      DshUtils.notify('删除失败: ' + err.message)
     }
   },
 }

@@ -1501,13 +1501,14 @@ window.dsh.server = {
       // Probe a DSH RPC endpoint and validate the response envelope, so we
       // only adopt a real DSH server — not any unrelated HTTP service that
       // happens to be listening on the configured port.
+      // NOTE: DSH uses dot-separated endpoints (session.list), NOT slashes.
       const result = await httpRequest(
         'POST',
-        '/api/session/list',
+        '/api/session.list',
         {
           type: 'client-request',
           rpcId: String(Date.now()),
-          method: 'session/list',
+          method: 'session.list',
           payload: { args: {} },
         },
         port,
@@ -2252,23 +2253,23 @@ window.dsh.cli = {
 // ------------------------------------------------------------
 
 /**
- * Generic DSH RPC call. DSH uses POST /api/<namespace>/<method>
+ * Generic DSH RPC call. DSH uses POST /api/<namespace>.<method>
  * with a ClientRequest envelope body.
- * @param {string} method - e.g. 'session.list' (dot-separated; converted to slash)
+ * @param {string} method - e.g. 'session.list' (dot-separated)
  * @param {object} payload - request payload (wrapped in args field)
  * @returns {Promise<object>} response value
  */
 async function rpc(method, payload = {}) {
-  // DSH RPC wire format: endpoint uses '/' separator (session/list, not session.list)
-  const endpoint = method.replace('.', '/')
+  // DSH RPC wire format: endpoint uses '.' separator (session.list),
+  // both in the URL path and in the method field of the envelope.
   const rpcId = crypto.randomUUID()
   const body = {
     type: 'client-request',
     rpcId,
-    method: endpoint,
+    method,
     payload: { args: payload },
   }
-  const result = await httpRequest('POST', `/api/${endpoint}`, body)
+  const result = await httpRequest('POST', `/api/${method}`, body)
   if (result.statusCode >= 400) {
     const errData = result.data
     const errMsg = errData?.result?.error?.message || errData?.error?.message || `HTTP ${result.statusCode}`
@@ -2374,9 +2375,6 @@ window.dsh.api = {
 
     /** Cancel the current agent turn. */
     async cancel(sessionId) { return rpc('session.cancel', { sessionId }) },
-
-    /** Delete a session. */
-    async delete(sessionId) { return rpc('session.delete', { sessionId }) },
   },
 
   // ----------------------------------------------------------

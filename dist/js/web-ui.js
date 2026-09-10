@@ -28,10 +28,18 @@ const WebUI = {
   lastExternalOpenTime: 0,
 
   /**
+   * Monotonic load generation — incremented on every load()/unload().
+   * Async callbacks capture it before awaiting and bail out if it changed,
+   * so a stale continuation can never mutate a torn-down/reloaded view.
+   */
+  loadGeneration: 0,
+
+  /**
    * Clear the iframe to stop it from making requests to a dead server.
    * Called before stop/restart to prevent ERR_CONNECTION_REFUSED errors.
    */
   unload() {
+    this.loadGeneration++
     const iframe = document.getElementById('dsh-iframe')
     if (iframe) {
       iframe.removeAttribute('src')
@@ -70,6 +78,7 @@ const WebUI = {
    * Load the DSH Web UI in the iframe.
    */
   load() {
+    this.loadGeneration++
     const iframe = document.getElementById('dsh-iframe')
     const loading = document.getElementById('web-ui-loading')
     const urlDisplay = document.getElementById('web-ui-url-display')
@@ -117,13 +126,14 @@ const WebUI = {
     })
 
     // Set a generous timeout — DSH Web UI is a large SPA, first load can be slow
+    const generation = this.loadGeneration
     this.loadTimeout = setTimeout(() => {
-      if (this.loaded) return
+      if (this.loaded || generation !== this.loadGeneration) return
       // Don't trust status.running: for adopted external servers there is no
       // process-exit event, so the flag stays true even after the server dies.
       // Verify with a real health check before showing a (possibly blank) iframe.
       window.dsh.server.healthCheck().then(({ healthy }) => {
-        if (this.loaded) return
+        if (this.loaded || generation !== this.loadGeneration) return
         if (healthy) {
           // Server is up but iframe didn't fire onload — just show it anyway
           loading.style.display = 'none'
@@ -132,6 +142,11 @@ const WebUI = {
         } else {
           this.handleLoadError()
         }
+      }).catch(() => {
+        // healthCheck itself failed (bridge unavailable etc.) — fall back to
+        // the reconnect/error path instead of leaving the spinner forever.
+        if (this.loaded || generation !== this.loadGeneration) return
+        this.handleLoadError()
       })
     }, 15000)
 

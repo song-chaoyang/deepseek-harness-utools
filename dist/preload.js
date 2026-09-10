@@ -279,28 +279,42 @@ function resolveNpm() {
  * Returns the absolute path to `@deepseek-ai/dsh/lib/bin.js`, or null when
  * DSH is not installed globally. Using this directly avoids the slow
  * npx registry round-trip on every server start.
+ * @param {{ fast?: boolean }} opts — fast mode skips the `npm root -g`
+ *   execSync probe (blocks up to 10s) and uses filesystem checks only.
  * @returns {string|null}
  */
-function resolveGlobalDshBin() {
+function resolveGlobalDshBin(opts = {}) {
   const nodeInfo = resolveNode()
   if (!nodeInfo.path) return null
 
-  // 1. Try npm root -g with the resolved node's npm
-  try {
+  if (opts.fast) {
+    // Filesystem-only guesses for common global layouts — no execSync.
     const nodeBinDir = path.dirname(nodeInfo.path)
-    const pathSep = process.platform === 'win32' ? ';' : ':'
-    const systemPath = process.env.PATH || process.env.Path || ''
-    const env = { ...process.env, PATH: nodeBinDir + pathSep + systemPath }
-    // Try npm from same bin/ dir as node
-    const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    const npmPath = path.join(nodeBinDir, npmBin)
-    const npmCmd = fs.existsSync(npmPath) ? `"${nodeInfo.path}" "${path.join(nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')}"` : `"${npmBin}"`
-    const out = execSync(`${npmCmd} root -g`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
-    if (out) {
-      const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    const prefix = nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir
+    const candidates = process.platform === 'win32'
+      ? [path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')]
+      : [path.join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')]
+    for (const bin of candidates) {
       if (fs.existsSync(bin)) return bin
     }
-  } catch { /* fall through to npx cache */ }
+  } else {
+    // 1. Try npm root -g with the resolved node's npm (slow — up to 10s execSync)
+    try {
+      const nodeBinDir = path.dirname(nodeInfo.path)
+      const pathSep = process.platform === 'win32' ? ';' : ':'
+      const systemPath = process.env.PATH || process.env.Path || ''
+      const env = { ...process.env, PATH: nodeBinDir + pathSep + systemPath }
+      // Try npm from same bin/ dir as node
+      const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+      const npmPath = path.join(nodeBinDir, npmBin)
+      const npmCmd = fs.existsSync(npmPath) ? `"${nodeInfo.path}" "${path.join(nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')}"` : `"${npmBin}"`
+      const out = execSync(`${npmCmd} root -g`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
+      if (out) {
+        const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+        if (fs.existsSync(bin)) return bin
+      }
+    } catch { /* fall through to npx cache */ }
+  }
 
   // 2. Try npx cache — DSH may already be cached from a previous `npx @deepseek-ai/dsh`
   try {
@@ -1037,6 +1051,7 @@ window.dsh.env = {
    * @returns {{ installed: boolean, version: string|null, method: string|null }}
    */
   hasDshInstalled(opts = {}) {
+    const skipNpx = !!opts.skipNpx
     const nodeInfo = resolveNode()
     if (!nodeInfo.path) return { installed: false, version: null, method: null }
 
@@ -1045,23 +1060,25 @@ window.dsh.env = {
     const systemPath = process.env.PATH || process.env.Path || ''
     const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
 
-    // 1. Check npx cache first (fast — no network, no execSync timeout)
-    const globalDshBin = resolveGlobalDshBin()
+    // 1. Check global/npx-cache installs (fast — no network, no execSync timeout)
+    const globalDshBin = resolveGlobalDshBin({ fast: skipNpx })
     if (globalDshBin) {
       try {
         const out = execSync(`"${nodeInfo.path}" "${globalDshBin}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
         return { installed: true, version: out.trim(), method: 'cache' }
       } catch { /* try other methods */ }
     }
+    // Fast mode stops here: everything below can block the renderer for
+    // 5s (dsh probe) to 30s (npx probe, may download the package).
+    if (skipNpx) return { installed: false, version: null, method: null }
 
-    // 2. Check global install (dsh in PATH)
+    // 2. Check global install (dsh in PATH) — execSync, blocks up to 5s
     try {
       const out = execSync('dsh --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000, env })
       return { installed: true, version: out.trim(), method: 'global' }
     } catch { /* not global */ }
 
     // 3. Check via npx (slow — may download, 30s timeout, blocks the UI)
-    if (opts.skipNpx) return { installed: false, version: null, method: null }
     const npxInfo = resolveNpx()
     if (npxInfo && nodeInfo.path) {
       try {
@@ -2200,11 +2217,12 @@ window.dsh.cli = {
   },
 
   /**
-   * Check if DSH is installed.
+   * Check if DSH is installed (fast check — skips the slow npx probe,
+   * see env.hasDshInstalled).
    * @returns {boolean}
    */
   isInstalled() {
-    return window.dsh.env.hasDshInstalled().installed
+    return window.dsh.env.hasDshInstalled({ skipNpx: true }).installed
   },
 
   /**

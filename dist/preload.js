@@ -1031,9 +1031,12 @@ window.dsh.env = {
   /**
    * Check if DSH is installed (globally or via npx cache).
    * Uses bundled or system npx.
+   * @param {{ skipNpx?: boolean }} opts — skip the slow npx check (may
+   *   block up to 30s and trigger a package download). UI entry points
+   *   MUST pass { skipNpx: true } to avoid freezing the plugin window.
    * @returns {{ installed: boolean, version: string|null, method: string|null }}
    */
-  hasDshInstalled() {
+  hasDshInstalled(opts = {}) {
     const nodeInfo = resolveNode()
     if (!nodeInfo.path) return { installed: false, version: null, method: null }
 
@@ -1057,7 +1060,8 @@ window.dsh.env = {
       return { installed: true, version: out.trim(), method: 'global' }
     } catch { /* not global */ }
 
-    // 3. Check via npx (slow — may download, 30s timeout)
+    // 3. Check via npx (slow — may download, 30s timeout, blocks the UI)
+    if (opts.skipNpx) return { installed: false, version: null, method: null }
     const npxInfo = resolveNpx()
     if (npxInfo && nodeInfo.path) {
       try {

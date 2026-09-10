@@ -118,10 +118,13 @@ const WebUI = {
 
     // Set a generous timeout — DSH Web UI is a large SPA, first load can be slow
     this.loadTimeout = setTimeout(() => {
-      if (!this.loaded) {
-        // Check if server is still running
-        const status = window.dsh.server.getStatus()
-        if (status.running) {
+      if (this.loaded) return
+      // Don't trust status.running: for adopted external servers there is no
+      // process-exit event, so the flag stays true even after the server dies.
+      // Verify with a real health check before showing a (possibly blank) iframe.
+      window.dsh.server.healthCheck().then(({ healthy }) => {
+        if (this.loaded) return
+        if (healthy) {
           // Server is up but iframe didn't fire onload — just show it anyway
           loading.style.display = 'none'
           iframe.style.display = 'block'
@@ -129,7 +132,7 @@ const WebUI = {
         } else {
           this.handleLoadError()
         }
-      }
+      })
     }, 15000)
 
     // Load the URL

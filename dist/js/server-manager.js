@@ -92,10 +92,12 @@ const ServerManager = {
       results.npxOk ? '可用' : '未找到 npx',
       results.npxOk ? 'success' : 'error')
 
-    // DSH: fast npx-cache check
+    // DSH: fast check only — MUST skip the npx path: it can execSync-block
+    // the renderer for up to 30s (or download the package), which uTools
+    // treats as "not responding" and kills the plugin window.
     let dshInstalled = false, dshVersion = null, dshMethod = null
     try {
-      const dshResult = window.dsh.env.hasDshInstalled()
+      const dshResult = window.dsh.env.hasDshInstalled({ skipNpx: true })
       dshInstalled = dshResult.installed
       dshVersion = dshResult.version
       dshMethod = dshResult.method

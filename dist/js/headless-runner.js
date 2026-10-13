@@ -12,6 +12,12 @@ const HeadlessRunner = {
   /** Current task output */
   output: '',
 
+  /** dbStorage key for the headless run history */
+  HISTORY_KEY: 'dsh-headless-history',
+
+  /** Max stored history entries */
+  HISTORY_MAX: 20,
+
   /** Predefined quick command templates */
   templates: [
     { id: 'review',   label: '🔍 代码审查', task: '请审查以下代码，关注安全性、性能和可读性：\n\n' },
@@ -21,6 +27,109 @@ const HeadlessRunner = {
     { id: 'fix-lint', label: '🐛 修复 Lint', task: '请修复以下 lint 错误：\n\n' },
     { id: 'doc',      label: '📝 生成文档', task: '请为以下代码生成 API 文档：\n\n' },
   ],
+
+  // ============================================================
+  //  Run history (uTools dbStorage, newest first, capped)
+  // ============================================================
+
+  /** @returns {Array<{id,task,workspace,model,ok,snippet,output,time}>} */
+  getHistory() {
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        return utools.dbStorage.getItem(this.HISTORY_KEY) || []
+      }
+    } catch { /* ignore */ }
+    return this._history || (this._history = [])
+  },
+
+  /**
+   * Append a completed run to the history (newest first, capped).
+   * @param {{task: string, workspace: string, model: string, ok: boolean, output: string}} entry
+   */
+  saveHistory(entry) {
+    const list = this.getHistory()
+    list.unshift({
+      id: 'hr_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      task: String(entry.task || '').slice(0, 500),
+      workspace: entry.workspace || '',
+      model: entry.model || '',
+      ok: !!entry.ok,
+      snippet: String(entry.output || '').replace(/\s+/g, ' ').slice(0, 120),
+      output: String(entry.output || '').slice(0, 20000),
+      time: Date.now(),
+    })
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        utools.dbStorage.setItem(this.HISTORY_KEY, list.slice(0, this.HISTORY_MAX))
+      } else {
+        this._history = list.slice(0, this.HISTORY_MAX)
+      }
+    } catch { /* ignore */ }
+    this.renderHistory()
+  },
+
+  clearHistory() {
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        utools.dbStorage.removeItem(this.HISTORY_KEY)
+      }
+    } catch { /* ignore */ }
+    this._history = []
+    this.renderHistory()
+  },
+
+  /**
+   * Render the history list into #hr-history-list. Clicking an item
+   * re-fills the form; actions: 重跑 / 复制输出.
+   */
+  renderHistory() {
+    const wrap = document.getElementById('hr-history')
+    const listEl = document.getElementById('hr-history-list')
+    if (!wrap || !listEl) return
+
+    const history = this.getHistory()
+    wrap.style.display = history.length ? 'block' : 'none'
+    if (!history.length) { listEl.innerHTML = ''; return }
+
+    listEl.innerHTML = history.map((h) => `
+      <div class="hr-history-item" data-id="${h.id}">
+        <div class="hr-history-main">
+          <div class="hr-history-task">${DshUtils.escapeHtml(h.task.split('\n')[0].slice(0, 80))}</div>
+          <div class="hr-history-meta">
+            <span class="hr-history-dot ${h.ok ? 'ok' : 'fail'}">${h.ok ? '✓' : '✗'}</span>
+            <span>${DshUtils.escapeHtml(h.model || '默认')}</span>
+            <span>${h.workspace ? DshUtils.escapeHtml(h.workspace.split('/').pop() || h.workspace) : ''}</span>
+            <span>${DshUtils.formatDate(new Date(h.time).toISOString())}</span>
+          </div>
+        </div>
+        <div class="hr-history-actions">
+          <button class="btn btn-sm btn-secondary" data-act="rerun">重跑</button>
+          <button class="btn btn-sm btn-secondary" data-act="copy" ${h.output ? '' : 'disabled'}>复制</button>
+        </div>
+      </div>
+    `).join('')
+
+    listEl.querySelectorAll('.hr-history-item').forEach((item) => {
+      const id = item.dataset.id
+      const entry = history.find((h) => h.id === id)
+      if (!entry) return
+      // Click task area → refill the form with this run's task/workspace
+      item.querySelector('.hr-history-main').addEventListener('click', () => {
+        document.getElementById('headless-task').value = entry.task
+        if (entry.workspace) document.getElementById('headless-workspace').value = entry.workspace
+        document.getElementById('headless-task').focus()
+      })
+      item.querySelector('[data-act="rerun"]').addEventListener('click', async () => {
+        document.getElementById('headless-task').value = entry.task
+        if (entry.workspace) document.getElementById('headless-workspace').value = entry.workspace
+        this.run()
+      })
+      item.querySelector('[data-act="copy"]').addEventListener('click', () => {
+        DshUtils.copyToClipboard(entry.output)
+        DshUtils.notify('已复制该次任务输出')
+      })
+    })
+  },
 
   /**
    * Load available models from the DSH server and uTools AI.
@@ -147,13 +256,17 @@ const HeadlessRunner = {
         contentEl.textContent = result.output
         this.output = result.output
       }
-      DshUtils.notify('DSH Headless 任务完成')
+      // Notification click jumps back to the headless feature (official
+      // showNotification(body, clickFeatureCode) — api-reference/system.md)
+      DshUtils.notify('✅ 任务完成：' + task.split('\n')[0].slice(0, 40), 'dsh-headless')
       if (result.output) {
         DshUtils.copyToClipboard(result.output)
       }
+      this.saveHistory({ task, workspace, model: model ? 'dsh:' + model : '', ok: true, output: result.output })
     } else {
       contentEl.textContent = `任务失败:\n\n${result.error || result.output || '未知错误'}`
-      DshUtils.notify('DSH Headless 任务失败')
+      DshUtils.notify('❌ 任务失败：' + task.split('\n')[0].slice(0, 40), 'dsh-headless')
+      this.saveHistory({ task, workspace, model: model ? 'dsh:' + model : '', ok: false, output: result.error || result.output || '' })
     }
   },
 
@@ -199,17 +312,19 @@ const HeadlessRunner = {
       btnRun.disabled = false
       btnRun.textContent = '运行任务'
 
-      DshUtils.notify('uTools AI 任务完成')
+      DshUtils.notify('✅ uTools AI 任务完成：' + task.split('\n')[0].slice(0, 40), 'dsh-headless')
       if (this.output) {
         DshUtils.copyToClipboard(this.output)
       }
+      this.saveHistory({ task, workspace, model: 'utools:' + modelId, ok: true, output: this.output })
     } catch (err) {
       this.running = false
       contentEl.classList.remove('streaming')
       btnRun.disabled = false
       btnRun.textContent = '运行任务'
       contentEl.textContent = `任务失败:\n\n${err.message || '未知错误'}`
-      DshUtils.notify('uTools AI 任务失败')
+      DshUtils.notify('❌ uTools AI 任务失败：' + task.split('\n')[0].slice(0, 40), 'dsh-headless')
+      this.saveHistory({ task, workspace, model: 'utools:' + modelId, ok: false, output: err.message || '' })
     }
   },
 
@@ -320,6 +435,13 @@ const HeadlessRunner = {
     const btnClear = document.getElementById('btn-headless-clear')
     if (btnClear) {
       btnClear.addEventListener('click', () => this.clear())
+    }
+
+    const btnClearHistory = document.getElementById('btn-clear-headless-history')
+    if (btnClearHistory) {
+      btnClearHistory.addEventListener('click', () => {
+        if (confirm('确定清空最近任务历史吗？')) this.clearHistory()
+      })
     }
 
     const btnCopy = document.getElementById('btn-copy-result')

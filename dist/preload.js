@@ -51,16 +51,241 @@ let bridgeServer = null
 let bridgeTargetPort = null
 let bridgeListenPort = null
 
+// Bridge-side session cookie jar (name → value).
+//
+// WHY: DSH ≥0.2.0's trust-fence session cookie is `SameSite=Strict`. The
+// Web UI lives in an embedded iframe whose top-level frame is the uTools
+// plugin page, so the browser computes site-for-cookies from the TOP level
+// and will NOT attach the Strict cookie to the iframe's requests — the
+// iframe loads the token URL (303 + Set-Cookie) yet the follow-up `/`
+// request arrives cookie-less and renders the 401 text page.
+// The bridge therefore holds the session SERVER-SIDE: it acquires it once
+// from the token URL and attaches it to every forwarded request. Browser
+// cookie policies become irrelevant.
+let bridgeCookieJar = new Map()
+
+/**
+ * Parse Set-Cookie header(s) from a DSH response into the jar.
+ * Keeps only the name=value pair (attributes are irrelevant server-side).
+ * @param {object} headers - Response headers (may contain set-cookie)
+ */
+function bridgeUpdateJarFromResponse(headers) {
+  const setCookies = headers['set-cookie']
+  if (!setCookies) return
+  const list = Array.isArray(setCookies) ? setCookies : [setCookies]
+  let updated = false
+  for (const raw of list) {
+    const m = String(raw).match(/^([^=;]+)=([^;]*)/)
+    if (!m) continue
+    const name = m[1].trim()
+    const value = m[2].trim()
+    if (!name) continue
+    // Empty value = deletion
+    if (!value) bridgeCookieJar.delete(name)
+    else bridgeCookieJar.set(name, value)
+    updated = true
+  }
+  if (updated) console.log(`[dsh] bridge session jar updated (${bridgeCookieJar.size} cookie(s))`)
+}
+
+/**
+ * Merge the bridge jar into an incoming Cookie header for forwarding.
+ * Jar entries win on name conflicts (they hold the authenticated session).
+ * @param {string|undefined} incomingCookie - Cookie header from the browser
+ * @returns {string|undefined} Merged Cookie header value
+ */
+function bridgeMergeCookie(incomingCookie) {
+  if (bridgeCookieJar.size === 0) return incomingCookie
+  const jarPairs = [...bridgeCookieJar.entries()].map(([k, v]) => `${k}=${v}`)
+  if (!incomingCookie) return jarPairs.join('; ')
+  // Incoming cookies first, jar overrides by name
+  const byName = new Map()
+  for (const part of String(incomingCookie).split(';')) {
+    const idx = part.indexOf('=')
+    if (idx > 0) byName.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim())
+  }
+  for (const [k, v] of bridgeCookieJar) byName.set(k, v)
+  return [...byName.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
+}
+
+/**
+ * Acquire the DSH trust-fence session cookie SERVER-SIDE.
+ * Performs the token-URL flow directly (bridge → DSH, no browser involved)
+ * and stores the resulting session cookie in the jar, so every request the
+ * bridge forwards afterwards is authenticated — regardless of the browser's
+ * SameSite / third-party-cookie behavior in the embedded iframe.
+ * @returns {Promise<boolean>} true when the jar now holds a session cookie
+ */
+async function bridgeAcquireSession() {
+  if (!dshWebUrl || !bridgeTargetPort) return false
+  const m = dshWebUrl.match(/[?&]token=([^&]+)/)
+  if (!m) return false // no-token build (DSH <0.2.0): nothing to acquire
+  return new Promise((resolve) => {
+    const req = http.get({
+      hostname: '127.0.0.1',
+      port: bridgeTargetPort,
+      path: `/?token=${encodeURIComponent(m[1])}`,
+      headers: { Accept: 'text/html' },
+      timeout: 8000,
+    }, (res) => {
+      bridgeUpdateJarFromResponse(res.headers)
+      res.resume()
+      res.on('end', () => resolve(bridgeCookieJar.size > 0))
+    })
+    req.on('error', () => resolve(false))
+    req.on('timeout', () => { req.destroy(); resolve(false) })
+  })
+}
+
 // ============================================================
 //  Utilities
 // ============================================================
 
 /**
- * Get the DSH home directory ($DSH_HOME or ~/.dsh).
+ * Plugin sandbox root — the DSH server and ALL its resources live under
+ * this directory (DSH_HOME, private npm cache, private runtime install),
+ * fully isolated from ~/.dsh (used by VS Code panel / CLI / other shells)
+ * and from the shared ~/.npm caches. Uses the uTools plugin-private local
+ * data path (official API, see api-reference/system.md) when available.
+ * @returns {string}
+ */
+function getSandboxRoot() {
+  if (typeof utools !== 'undefined' && utools.getPluginLocalDataPath) {
+    try {
+      return path.join(utools.getPluginLocalDataPath(), 'dsh-sandbox')
+    } catch { /* fallthrough */ }
+  }
+  // Dev fallback (outside uTools): a dedicated directory, never ~/.dsh
+  return path.join(os.homedir(), '.dsh-utools-sandbox')
+}
+
+/**
+ * Get the DSH home directory — the SANDBOXED home.
+ * Every process we spawn gets DSH_HOME=<sandbox>/home so profiles,
+ * plugins, sessions and settings never touch ~/.dsh or other shells.
+ * ($DSH_HOME env is honored ONLY in dev runs without utools, where the
+ * test harness sets it explicitly.)
  * @returns {string}
  */
 function getDshHome() {
-  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+  return path.join(getSandboxRoot(), 'home')
+}
+
+/**
+ * Private npm cache — npx/npm downloads stay inside the sandbox and
+ * never read or write the shared ~/.npm caches of other tools.
+ * @returns {string}
+ */
+function getSandboxNpmCache() {
+  return path.join(getSandboxRoot(), 'npm-cache')
+}
+
+/**
+ * Private runtime install dir — `npm install --prefix` target for the
+ * plugin-managed DSH copy (instead of a shared global install).
+ * @returns {string}
+ */
+function getSandboxRuntimeDir() {
+  return path.join(getSandboxRoot(), 'runtime')
+}
+
+/**
+ * Ensure the sandbox skeleton exists.
+ */
+function ensureSandboxDirs() {
+  for (const dir of [getDshHome(), getSandboxNpmCache(), getSandboxRuntimeDir()]) {
+    try { fs.mkdirSync(dir, { recursive: true }) } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Check whether anything is listening on a TCP port (raw connect probe).
+ * @param {number} port
+ * @returns {Promise<boolean>}
+ */
+function isTcpPortOccupied(port) {
+  return new Promise((resolve) => {
+    const netMod = require('net')
+    const sock = netMod.connect({ port, host: '127.0.0.1', timeout: 600 })
+    sock.on('connect', () => { sock.destroy(); resolve(true) })
+    sock.on('error', () => resolve(false))
+    sock.on('timeout', () => { sock.destroy(); resolve(false) })
+  })
+}
+
+/**
+ * Find the first free TCP port, starting from `startPort` (inclusive),
+ * scanning at most 20 candidates. Falls back to a random OS-assigned
+ * port when all candidates are busy.
+ * @param {number} startPort
+ * @returns {Promise<number>}
+ */
+function findFreePort(startPort) {
+  return new Promise((resolve) => {
+    const netMod = require('net')
+    const tryPort = (port, remaining) => {
+      const srv = netMod.createServer()
+      srv.once('error', () => {
+        if (remaining > 0) tryPort(port + 1, remaining - 1)
+        else {
+          // All candidates busy — ask the OS for any free port
+          const tmp = netMod.createServer()
+          tmp.listen(0, '127.0.0.1', () => {
+            const p = tmp.address().port
+            tmp.close(() => resolve(p))
+          })
+        }
+      })
+      srv.listen(port, '127.0.0.1', () => {
+        const p = srv.address().port
+        srv.close(() => resolve(p))
+      })
+    }
+    tryPort(startPort, 20)
+  })
+}
+
+/**
+ * Kill OUR OWN orphaned DSH processes listening on a port.
+ *
+ * A previous plugin session may have died without stopping its DSH child
+ * (e.g. uTools was force-quit) — the child is re-parented to init/launchd
+ * and keeps the configured port forever, which then breaks the next start
+ * with EADDRINUSE. Only processes whose command line matches BOTH
+ *   (a) an @deepseek-ai/dsh entry, and
+ *   (b) a path owned by this plugin (uTools bundled runtime, our sandbox,
+ *       or our private npm cache)
+ * are killed — DSH servers started by the user's terminal, VS Code panel
+ * or other shells are never touched.
+ * Best-effort: darwin/linux only (lsof); silently no-ops elsewhere.
+ * @param {number} port
+ * @returns {number} number of processes killed
+ */
+function killOrphanDshProcesses(port) {
+  if (process.platform === 'win32') return 0
+  let killed = 0
+  try {
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -Fp 2>/dev/null`, {
+      encoding: 'utf8', timeout: 5000,
+    })
+    const pids = out.split('\n').map((l) => l.trim()).filter((l) => /^p\d+$/.test(l)).map((l) => parseInt(l.slice(1), 10))
+    for (const pid of pids) {
+      let cmdline = ''
+      try {
+        cmdline = execSync(`ps -p ${pid} -o command= 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim()
+      } catch { continue }
+      const isDsh = cmdline.includes('@deepseek-ai/dsh')
+      const isOurs = cmdline.includes('uTools') || cmdline.includes(getSandboxRoot())
+      if (isDsh && isOurs) {
+        try {
+          process.kill(pid, 'SIGTERM')
+          killed++
+          console.log(`[dsh] killed own orphaned DSH process (pid=${pid}) on port ${port}`)
+        } catch { /* already gone */ }
+      }
+    }
+  } catch { /* lsof failed / nothing listening */ }
+  return killed
 }
 
 /**
@@ -75,7 +300,8 @@ function getRuntimeDir() {
       return path.join(utools.getPath('userData'), 'runtime')
     } catch { /* fallthrough */ }
   }
-  return path.join(os.homedir(), '.dsh', 'utools-runtime')
+  // Dev fallback — inside the sandbox, never ~/.dsh
+  return path.join(getSandboxRoot(), 'node-runtime')
 }
 
 /**
@@ -275,56 +501,51 @@ function resolveNpm() {
 }
 
 /**
- * Resolve the globally-installed DSH CLI entry (npm global install).
- * Returns the absolute path to `@deepseek-ai/dsh/lib/bin.js`, or null when
- * DSH is not installed globally. Using this directly avoids the slow
- * npx registry round-trip on every server start.
- * @param {{ fast?: boolean }} opts — fast mode skips the `npm root -g`
- *   execSync probe (blocks up to 10s) and uses filesystem checks only.
+ * Resolve a directly-runnable DSH CLI entry, sandbox-first.
+ * Resolution order (STRICT — never the shared ~/.npm caches or the user's
+ * system-global installs, so the sandbox has zero association with
+ * external resources):
+ *   1. Plugin-managed runtime install: <sandbox>/runtime/node_modules/…
+ *      (created by cli.install() via `npm install --prefix`)
+ *   2. Plugin-private npx cache: <sandbox>/npm-cache/_npx/…
+ *      (bootstrapped when start()/install() run npx with
+ *      npm_config_cache=<sandbox>/npm-cache)
+ *   3. uTools bundled runtime's global install — the runtime node shipped
+ *      with uTools that this plugin manages; not a user-system resource.
+ * Returns null when none exist — start() then spawns npx (private cache),
+ * which downloads DSH into the sandbox on first run.
  * @returns {string|null}
  */
-function resolveGlobalDshBin(opts = {}) {
+function resolveGlobalDshBin() {
   const nodeInfo = resolveNode()
   if (!nodeInfo.path) return null
 
-  if (opts.fast) {
-    // Filesystem-only guesses for common global layouts — no execSync.
-    const nodeBinDir = path.dirname(nodeInfo.path)
-    const prefix = nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir
-    const candidates = process.platform === 'win32'
-      ? [path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')]
-      : [path.join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')]
-    for (const bin of candidates) {
-      if (fs.existsSync(bin)) return bin
-    }
-  } else {
-    // 1. Try npm root -g with the resolved node's npm (slow — up to 10s execSync)
-    try {
-      const nodeBinDir = path.dirname(nodeInfo.path)
-      const pathSep = process.platform === 'win32' ? ';' : ':'
-      const systemPath = process.env.PATH || process.env.Path || ''
-      const env = { ...process.env, PATH: nodeBinDir + pathSep + systemPath }
-      // Try npm from same bin/ dir as node
-      const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-      const npmPath = path.join(nodeBinDir, npmBin)
-      const npmCmd = fs.existsSync(npmPath) ? `"${nodeInfo.path}" "${path.join(nodeBinDir.endsWith('bin') ? path.dirname(nodeBinDir) : nodeBinDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')}"` : `"${npmBin}"`
-      const out = execSync(`${npmCmd} root -g`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 10000, env }).trim()
-      if (out) {
-        const bin = path.join(out, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-        if (fs.existsSync(bin)) return bin
-      }
-    } catch { /* fall through to npx cache */ }
-  }
-
-  // 2. Try npx cache — DSH may already be cached from a previous `npx @deepseek-ai/dsh`
+  // 1. Plugin-managed runtime install (sandbox)
   try {
-    const npxCacheDir = path.join(os.homedir(), '.npm', '_npx')
-    if (fs.existsSync(npxCacheDir)) {
-      const entries = fs.readdirSync(npxCacheDir)
-      for (const entry of entries) {
-        const bin = path.join(npxCacheDir, entry, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    const sandboxBin = path.join(getSandboxRuntimeDir(), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    if (fs.existsSync(sandboxBin)) return sandboxBin
+  } catch { /* ignore */ }
+
+  // 2. Plugin-private npx cache (sandbox)
+  try {
+    const privateNpx = path.join(getSandboxNpmCache(), '_npx')
+    if (fs.existsSync(privateNpx)) {
+      for (const entry of fs.readdirSync(privateNpx)) {
+        const bin = path.join(privateNpx, entry, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
         if (fs.existsSync(bin)) return bin
       }
+    }
+  } catch { /* ignore */ }
+
+  // 3. uTools bundled runtime's global install (started-by-us environment)
+  try {
+    const bundled = getBundledPaths()
+    if (bundled.node) {
+      const runtimeDir = path.dirname(path.dirname(bundled.node)) // <runtime>/node
+      const globalBin = process.platform === 'win32'
+        ? path.join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+        : path.join(runtimeDir, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+      if (fs.existsSync(globalBin)) return globalBin
     }
   } catch { /* ignore */ }
 
@@ -593,6 +814,146 @@ function versionGte(actual, required) {
 }
 
 /**
+ * Parse a semver-ish string (with optional prerelease) into comparable parts.
+ * "0.1.5-rc.2" → { major: 0, minor: 1, patch: 5, pre: ['rc', 2] }
+ * @param {string} v
+ * @returns {{ major: number, minor: number, patch: number, pre: (number|string)[] } | null}
+ */
+function parseSemver(v) {
+  const m = String(v || '').trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?$/)
+  if (!m) return null
+  const pre = m[4]
+    ? m[4].split('.').map((p) => (/^\d+$/.test(p) ? Number(p) : p))
+    : []
+  return { major: +m[1], minor: +m[2], patch: +m[3], pre }
+}
+
+/**
+ * Prerelease-aware semver comparison: -1 / 0 / 1.
+ * Per semver: a prerelease sorts LOWER than its release (0.1.5-rc.1 < 0.1.5).
+ */
+function compareSemver(a, b) {
+  const pa = parseSemver(a)
+  const pb = parseSemver(b)
+  if (!pa || !pb) return 0
+  for (const key of ['major', 'minor', 'patch']) {
+    if (pa[key] !== pb[key]) return pa[key] < pb[key] ? -1 : 1
+  }
+  const len = Math.max(pa.pre.length, pb.pre.length)
+  // Semver rule 11: a version WITHOUT a prerelease sorts HIGHER than the
+  // same version WITH one (0.1.5 > 0.1.5-rc.2).
+  if (pa.pre.length === 0 && pb.pre.length === 0) return 0
+  if (pa.pre.length === 0) return 1
+  if (pb.pre.length === 0) return -1
+  for (let i = 0; i < len; i++) {
+    const x = pa.pre[i]
+    const y = pb.pre[i]
+    if (x === undefined) return -1 // shorter prerelease list sorts lower
+    if (y === undefined) return 1
+    if (x === y) continue
+    const xNum = typeof x === 'number'
+    const yNum = typeof y === 'number'
+    if (xNum && yNum) return x < y ? -1 : 1
+    if (xNum) return -1 // numeric identifiers sort lower than alphanumeric
+    if (yNum) return 1
+    return x < y ? -1 : 1
+  }
+  return 0
+}
+
+/**
+ * Extract the LOWER bound version from a semver range string.
+ * Supports: "*", ">=x.y.z", "^x.y.z", "~x.y.z", "x.y.z" (exact → that version).
+ * @returns {string|null} lower bound version, or null when unbounded
+ */
+function semverRangeFloor(range) {
+  const r = String(range || '').trim()
+  if (!r || r === '*' || r === 'latest' || r === 'x') return null
+  const m = r.match(/(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)/)
+  return m ? m[1] : null
+}
+
+/**
+ * Scan the profile's installed plugins and check their DSH requirements
+ * against the actually-resolved DSH version. This detects the
+ * "community plugin built against a newer DSH core" case that crashes
+ * the Web UI React tree (e.g. React error #130, blank content).
+ * Synchronous + filesystem-only — safe to call from the renderer.
+ * @param {string} profile
+ * @returns {{ dshVersion: string|null, incompatible: Array<{name, version, required, via}>, checked: number }}
+ */
+function checkPluginCompatImpl(profile) {
+  const out = { dshVersion: null, incompatible: [], checked: 0 }
+
+  // Resolve the DSH version the server would actually use
+  const nodeInfo = resolveNode()
+  const globalDshBin = nodeInfo.path ? resolveGlobalDshBin({ fast: true }) : null
+  if (globalDshBin) {
+    try {
+      const v = execSync(`"${nodeInfo.path}" "${globalDshBin}" --version`, {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000,
+      }).trim()
+      out.dshVersion = v
+    } catch { /* fall through with null version */ }
+  }
+  if (!out.dshVersion) return out
+
+  const nmDir = path.join(getDshHome(), 'profiles', profile || DEFAULT_PROFILE, 'node_modules')
+  if (!fs.existsSync(nmDir)) return out
+
+  /** @type {Array<(string|null)>} package dirs, including scoped subdirs */
+  const pkgDirs = []
+  try {
+    for (const entry of fs.readdirSync(nmDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
+      if (entry.name.startsWith('.')) continue
+      if (entry.name.startsWith('@')) {
+        const scopeDir = path.join(nmDir, entry.name)
+        try {
+          for (const sub of fs.readdirSync(scopeDir, { withFileTypes: true })) {
+            if (sub.isDirectory() || sub.isSymbolicLink()) pkgDirs.push(path.join(scopeDir, sub.name))
+          }
+        } catch { /* unreadable scope */ }
+      } else {
+        pkgDirs.push(path.join(nmDir, entry.name))
+      }
+    }
+  } catch { /* unreadable node_modules */ }
+
+  for (const dir of pkgDirs) {
+    const pkgJsonPath = path.join(dir, 'package.json')
+    if (!fs.existsSync(pkgJsonPath)) continue
+    let pkg
+    try { pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8')) } catch { continue }
+    if (!pkg || !pkg.name) continue
+    // Skip DSH core's own packages — they ARE the reference version
+    if (pkg.name.startsWith('@deepseek-ai/')) continue
+
+    out.checked++
+
+    // Collect requirements: engines.dsh + peerDependencies on @deepseek-ai/dsh-* packages
+    let floor = null
+    let via = ''
+    const consider = (range, label) => {
+      const f = semverRangeFloor(range)
+      if (!f) return
+      if (!floor || compareSemver(f, floor) > 0) { floor = f; via = label }
+    }
+    if (pkg.engines && pkg.engines.dsh) consider(pkg.engines.dsh, 'engines.dsh')
+    const peers = pkg.peerDependencies || {}
+    for (const [dep, range] of Object.entries(peers)) {
+      // Only DSH core packages track the DSH version; skip the cordis framework
+      if (/^@deepseek-ai\/dsh(-|$)/.test(dep)) consider(range, dep)
+    }
+    if (floor && compareSemver(out.dshVersion, floor) < 0) {
+      out.incompatible.push({ name: pkg.name, version: pkg.version || '?', required: floor, via })
+    }
+  }
+
+  return out
+}
+
+/**
  * Simple YAML parser for flat key-value files (settings.yaml, credentials).
  * Not a full YAML parser — handles only the subset DSH config uses.
  * @param {string} content
@@ -735,6 +1096,39 @@ function httpRequest(method, urlPath, body = null, port = serverStatus.port) {
 // ============================================================
 
 /**
+ * Tokenized Web UI entry URL captured from the DSH process output.
+ * `dsh web` prints its authenticated URL at startup (browser-trust fence);
+ * loading the bare origin returns 401 "authentication required", so the
+ * iframe must use this URL. Reset on every server start/stop.
+ */
+let dshWebUrl = null
+
+/**
+ * Extract the loopback Web UI entry URL from DSH process output.
+ * Accepts `dsh web: <url>` style lines and bare `http://127.0.0.1:<port>/...`
+ * URLs on the configured port. LAN (non-loopback) advertisements are ignored —
+ * the iframe must stay on loopback.
+ * @param {string} text - a chunk of process stdout/stderr
+ */
+function captureWebUrl(text) {
+  if (!text || !serverStatus || !serverStatus.port) return
+  const port = serverStatus.port
+  // Prefer the explicit `dsh web:` line, fall back to any loopback URL on our port
+  const lineMatch = text.match(/dsh web:?[^ ]* (https?:\/\/[^\s]+)/i)
+  const candidates = []
+  if (lineMatch) candidates.push(lineMatch[1])
+  const loose = text.match(new RegExp(`https?://(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):${port}[^\\s"')]*`, 'g'))
+  if (loose) candidates.push(...loose)
+  for (const url of candidates) {
+    if (url.startsWith(`http://127.0.0.1:${port}`) || url.startsWith(`http://localhost:${port}`) || url.startsWith('http://[::1]:' + port)) {
+      dshWebUrl = url.replace(/[.,)]+$/, '')
+      console.log(`[dsh] captured Web UI entry URL: ${dshWebUrl}`)
+      return
+    }
+  }
+}
+
+/**
  * Small bridge script served at /__dsh_link_bridge.js inside the
  * DSH iframe. Intercepts external-link clicks and window.open(),
  * forwarding the URL to the parent page via postMessage.
@@ -743,6 +1137,42 @@ const LINK_BRIDGE_SCRIPT = `;(function () {
   if (window.__dshLinkBridgeInstalled) return
   window.__dshLinkBridgeInstalled = true
   var origin = window.location.origin
+  // The real DSH server origin (http://127.0.0.1:3080). URLs pointing here
+  // are the SAME app behind the proxy — they must navigate inside this
+  // iframe (rewritten to the bridge origin), never to the system browser.
+  var targetOrigin = '__DSH_TARGET_ORIGIN__'
+
+  // NOTE: no regex literals here — this script lives inside a template
+  // literal in preload.js and escape-layer bugs are easy to make. Plain
+  // prefix checks are equivalent (loopback host on any port) and safe.
+  function isLocalUrl(url) {
+    var u = String(url || '')
+    var hosts = [
+      'http://127.0.0.1:', 'http://localhost:', 'http://[::1]:',
+      'http://127.0.0.1/', 'http://localhost/', 'http://[::1]/',
+    ]
+    for (var i = 0; i < hosts.length; i++) {
+      if (u.indexOf(hosts[i]) === 0) return true
+    }
+    return false
+  }
+
+  // Map any local (loopback) URL onto the bridge origin so the SPA stays
+  // behind the proxy (keeps the injected bridge script + same-origin APIs).
+  // Covers the direct DSH origin (http://127.0.0.1:3080) and host variants
+  // (localhost / [::1], any port) — path and query are preserved.
+  function toBridgeUrl(url) {
+    var u = String(url)
+    if (targetOrigin && u.indexOf(targetOrigin) === 0) {
+      return origin + u.slice(targetOrigin.length)
+    }
+    if (isLocalUrl(u)) {
+      var idx = u.indexOf('/', u.indexOf('://') + 3)
+      var rest = idx === -1 ? '/' : u.slice(idx)
+      return origin + rest
+    }
+    return u
+  }
 
   function openExternal(url) {
     if (!url) return
@@ -751,31 +1181,63 @@ const LINK_BRIDGE_SCRIPT = `;(function () {
     } catch (e) {}
   }
 
+  // Navigate this iframe. Local (DSH/bridge) URLs stay in-frame; only
+  // genuinely external URLs go to the system browser. This is what stops
+  // plugins / window.open() from yanking the user out of uTools.
+  function navigateInFrame(url) {
+    var mapped = toBridgeUrl(url)
+    if (isLocalUrl(url)) {
+      try { window.location.href = mapped } catch (e) {}
+      return
+    }
+    openExternal(url)
+  }
+
+  // Handle a link click: decide in-frame vs external, and stop the browser's
+  // default navigation so target=_blank never spawns a new window/browser.
+  function handleLink(e, href, target) {
+    if (!href) return
+    var handled = false
+    if (target === '_blank' || target === '_new') {
+      if (isLocalUrl(href)) navigateInFrame(href)
+      else openExternal(href)
+      handled = true
+    } else if (
+      href.indexOf(origin) !== 0 &&
+      href.indexOf('about:') !== 0 &&
+      href.indexOf('javascript:') !== 0 &&
+      href.indexOf('data:') !== 0
+    ) {
+      if (isLocalUrl(href)) navigateInFrame(href)
+      else openExternal(href)
+      handled = true
+    }
+    if (handled) {
+      e.preventDefault()
+      e.stopPropagation()
+    }
+  }
+
   // Capture clicks on <a> tags (capture phase, before the SPA handles them)
   document.addEventListener('click', function (e) {
     var a = e.target && e.target.closest ? e.target.closest('a[href]') : null
     if (!a || !a.href) return
-    var href = a.href
-    var target = a.target || ''
-    var external = href.indexOf(origin) !== 0 &&
-      href.indexOf('about:') !== 0 &&
-      href.indexOf('javascript:') !== 0 &&
-      href.indexOf('data:') !== 0
-    // target=_blank or links pointing outside the DSH origin → system browser
-    if (target === '_blank' || target === '_new' || external) {
-      e.preventDefault()
-      e.stopPropagation()
-      openExternal(href)
-      return false
-    }
+    handleLink(e, a.href, a.target || '')
   }, true)
 
-  // window.open() calls (e.g. JS-driven popups) → system browser
+  // window.open() calls (e.g. JS-driven popups) → local: stay in this
+  // iframe; external: system browser. Plugins like remote-web-ui auto-call
+  // window.open(http://127.0.0.1:3080/...) which previously popped the
+  // browser — a local URL now navigates in-frame instead.
   var nativeOpen = window.open
   if (nativeOpen) {
     window.open = function (url) {
       if (url && typeof url === 'string' && url.indexOf('about:') !== 0) {
-        openExternal(url)
+        if (isLocalUrl(url)) {
+          navigateInFrame(url)
+        } else {
+          openExternal(url)
+        }
       }
       return null
     }
@@ -804,6 +1266,29 @@ const LINK_BRIDGE_SCRIPT = `;(function () {
       }, '*')
     } catch (err) {}
   }, true)
+
+  // Report client-side errors (React crashes, plugin render failures, …) to
+  // the parent so a blank/crashed Web UI shows an actionable message instead
+  // of an empty dark page (e.g. plugin ↔ DSH core version incompatibility).
+  function reportClientError(message, source) {
+    try {
+      window.parent.postMessage({
+        type: 'dsh-client-error',
+        message: String(message || 'Unknown error').slice(0, 1000),
+        source: String(source || '').slice(0, 300),
+      }, '*')
+    } catch (e) {}
+  }
+  window.addEventListener('error', function (e) {
+    if (e && e.message) {
+      reportClientError(e.message, e.filename ? (e.filename + ':' + e.lineno) : '')
+    }
+  }, true)
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason
+    var msg = r && (r.message || r)
+    if (msg) reportClientError('Unhandled rejection: ' + msg, r && r.stack ? String(r.stack).split('\\n')[0] : '')
+  }, true)
 })()`
 
 /**
@@ -819,13 +1304,15 @@ function startBridge(listenPort, targetPort) {
     bridgeTargetPort = targetPort
 
     const server = http.createServer((req, res) => {
-      // Serve the bridge script itself (same-origin with the DSH page)
+      // Serve the bridge script itself (same-origin with the DSH page).
+      // Substitute the real DSH origin so the script can rewrite local
+      // (direct-origin) URLs back onto the bridge.
       if (req.url === '/__dsh_link_bridge.js') {
         res.writeHead(200, {
           'Content-Type': 'application/javascript; charset=utf-8',
           'Cache-Control': 'no-store',
         })
-        res.end(LINK_BRIDGE_SCRIPT)
+        res.end(LINK_BRIDGE_SCRIPT.replace('__DSH_TARGET_ORIGIN__', `http://127.0.0.1:${bridgeTargetPort}`))
         return
       }
       bridgeProxyRequest(req, res)
@@ -857,6 +1344,9 @@ function stopBridge() {
   }
   bridgeTargetPort = null
   bridgeListenPort = null
+  // Fresh server → fresh trust session; drop the stale jar so a new one is
+  // acquired from the (new) token on the next start()/page load.
+  bridgeCookieJar = new Map()
 }
 
 /**
@@ -875,6 +1365,10 @@ function rewriteBridgeHeaders(headers) {
   if (out.referer) {
     out.referer = String(out.referer).replace(/^https?:\/\/[^/]+/, targetOrigin)
   }
+  // Attach the bridge-held trust session (SameSite=Strict cookies are not
+  // sent by browsers in cross-site iframes — the jar guarantees trust).
+  const mergedCookie = bridgeMergeCookie(out.cookie)
+  if (mergedCookie) out.cookie = mergedCookie
   // Force identity encoding so HTML can be rewritten before forwarding
   delete out['accept-encoding']
   return out
@@ -901,6 +1395,15 @@ function rewriteBridgeResponseHeaders(headers) {
       String(out['access-control-allow-credentials'] || '').toLowerCase() === 'true') {
     out['access-control-allow-origin'] = bridgeOrigin
   }
+  // Rewrite redirect targets: a 3xx Location pointing at the DSH's own
+  // origin (http://127.0.0.1:3080/...) would bounce the iframe OFF the
+  // bridge (losing the injected script and same-origin APIs), and the
+  // subsequent origin mismatch is what previously popped the system
+  // browser. Keep redirects on the bridge origin instead.
+  const targetOrigin = `http://127.0.0.1:${bridgeTargetPort}`
+  if (out.location && String(out.location).startsWith(targetOrigin)) {
+    out.location = bridgeOrigin + String(out.location).slice(targetOrigin.length)
+  }
   return out
 }
 
@@ -908,7 +1411,7 @@ function rewriteBridgeResponseHeaders(headers) {
  * Forward a normal HTTP request to the DSH server, injecting the
  * bridge script into text/html responses.
  */
-function bridgeProxyRequest(req, res) {
+function bridgeProxyRequest(req, res, retried = false) {
   if (!bridgeTargetPort) {
     res.writeHead(502)
     res.end()
@@ -916,18 +1419,34 @@ function bridgeProxyRequest(req, res) {
   }
   const headers = rewriteBridgeHeaders(req.headers)
 
-  const proxyReq = http.request({
-    hostname: '127.0.0.1',
-    port: bridgeTargetPort,
-    path: req.url,
-    method: req.method,
-    headers,
-  }, (proxyRes) => {
+  const proxyResHandler = (proxyRes) => {
+    // Harvest any new/refreshed session cookie into the jar (forwarding the
+    // Set-Cookie to the browser unchanged below).
+    try { bridgeUpdateJarFromResponse(proxyRes.headers) } catch { /* ignore */ }
+
     const ct = String(proxyRes.headers['content-type'] || '').toLowerCase()
     const isHtml = ct.includes('text/html')
     if (!isHtml) {
       res.writeHead(proxyRes.statusCode, rewriteBridgeResponseHeaders(proxyRes.headers))
       proxyRes.pipe(res)
+      return
+    }
+
+    // A page GET that still answers 401 means the jar's session went stale
+    // (e.g. DSH restarted with a new token). Re-acquire once and retry.
+    if (proxyRes.statusCode === 401 && !retried && req.method === 'GET') {
+      proxyRes.resume()
+      proxyRes.on('end', () => {
+        bridgeAcquireSession().then((ok) => {
+          if (ok) {
+            console.log('[dsh] bridge session re-acquired, retrying page request')
+            bridgeProxyRequest(req, res, true)
+          } else {
+            res.writeHead(401, rewriteBridgeResponseHeaders(proxyRes.headers))
+            res.end()
+          }
+        })
+      })
       return
     }
 
@@ -971,7 +1490,15 @@ function bridgeProxyRequest(req, res) {
       }
     })
     proxyRes.on('error', () => { try { res.end() } catch { /* ignore */ } })
-  })
+  }
+
+  const proxyReq = http.request({
+    hostname: '127.0.0.1',
+    port: bridgeTargetPort,
+    path: req.url,
+    method: req.method,
+    headers,
+  }, (proxyRes) => proxyResHandler(proxyRes))
 
   proxyReq.on('error', () => {
     try { res.writeHead(502); res.end() } catch { /* ignore */ }
@@ -1051,49 +1578,53 @@ window.dsh.env = {
    * @returns {{ installed: boolean, version: string|null, method: string|null }}
    */
   hasDshInstalled(opts = {}) {
-    const skipNpx = !!opts.skipNpx
     const nodeInfo = resolveNode()
     if (!nodeInfo.path) return { installed: false, version: null, method: null }
 
-    // Build env with resolved node in PATH
-    const pathSep = process.platform === 'win32' ? ';' : ':'
-    const systemPath = process.env.PATH || process.env.Path || ''
-    const env = { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath }
-
-    // 1. Check global/npx-cache installs (fast — no network, no execSync timeout)
-    const globalDshBin = resolveGlobalDshBin({ fast: skipNpx })
-    if (globalDshBin) {
+    // 1. Sandbox installs only (fast — pure filesystem + one --version probe).
+    //    The user's system-global `dsh`, the shared ~/.npm npx cache and other
+    //    shells' installs are deliberately NOT considered: the server runs
+    //    sandboxed, so its presence/absence elsewhere is irrelevant.
+    const sandboxBin = resolveGlobalDshBin()
+    if (sandboxBin) {
       try {
-        const out = execSync(`"${nodeInfo.path}" "${globalDshBin}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
-        return { installed: true, version: out.trim(), method: 'cache' }
-      } catch { /* try other methods */ }
+        const out = execSync(`"${nodeInfo.path}" "${sandboxBin}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000 })
+        return { installed: true, version: out.trim(), method: 'sandbox' }
+      } catch { /* probe failed — report uninstalled */ }
     }
-    // Fast mode stops here: everything below can block the renderer for
-    // 5s (dsh probe) to 30s (npx probe, may download the package).
-    if (skipNpx) return { installed: false, version: null, method: null }
 
-    // 2. Check global install (dsh in PATH) — execSync, blocks up to 5s
-    try {
-      const out = execSync('dsh --version', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 5000, env })
-      return { installed: true, version: out.trim(), method: 'global' }
-    } catch { /* not global */ }
-
-    // 3. Check via npx (slow — may download, 30s timeout, blocks the UI)
-    const npxInfo = resolveNpx()
-    if (npxInfo && nodeInfo.path) {
-      try {
-        const npxArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'].join(' ')
-        const out = execSync(`"${npxInfo.cmd}" ${npxArgs}`, {
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'ignore'],
-          timeout: 30000,
-          env,
-        })
-        return { installed: true, version: out.trim(), method: 'npx' }
-      } catch { /* npx failed */ }
+    // 2. (Optional, non-UI paths) probe the PRIVATE npx cache by running npx
+    //    with the sandbox cache dir — may download into the sandbox (slow,
+    //    up to 30s); UI entry points pass { skipNpx: true }.
+    if (!opts.skipNpx) {
+      const npxInfo = resolveNpx()
+      if (npxInfo) {
+        try {
+          const env = { ...process.env, npm_config_cache: getSandboxNpmCache() }
+          const npxArgs = [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'].join(' ')
+          const out = execSync(`"${npxInfo.cmd}" ${npxArgs}`, {
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'ignore'],
+            timeout: 30000,
+            env,
+          })
+          return { installed: true, version: out.trim(), method: 'npx' }
+        } catch { /* npx failed */ }
+      }
     }
 
     return { installed: false, version: null, method: null }
+  },
+
+  /**
+   * Check installed profile plugins against the resolved DSH version.
+   * Detects community plugins built for a newer DSH core (the "blank Web UI"
+   * React crash case). Filesystem-only, synchronous.
+   * @param {string} [profile]
+   * @returns {{ dshVersion: string|null, incompatible: Array<{name, version, required, via}>, checked: number }}
+   */
+  checkPluginCompat(profile) {
+    return checkPluginCompatImpl(profile)
   },
 
   /**
@@ -1219,28 +1750,42 @@ window.dsh.server = {
     // Yield before synchronous execSync calls to let UI render
     await new Promise(r => setTimeout(r, 0))
 
-    // If the configured port already has a healthy DSH service running
-    // (e.g. a leftover process from a previous session, or an externally
-    // started server), adopt it instead of spawning a new one — spawning
-    // would fail with EADDRINUSE and leave the user with a confusing error.
+    // ── Port arbitration (sandboxed) ──
+    // The DSH server must never share a port with foreign processes:
+    // 1. Kill OUR OWN orphaned DSH from a previous plugin session
+    //    (crashed uTools leaves children re-parented to init holding the port).
+    // 2. If the port is still busy after that, it belongs to a foreign service
+    //    (user's VS Code panel DSH, CLI, or an unrelated app) — under the
+    //    full-isolation mandate we do NOT adopt it; pick a free port instead.
+    let actualPort = port
     try {
-      const probeHealthy = await this.probePort(port)
-      if (probeHealthy) {
-        console.log(`[dsh] port ${port} already serves DSH — adopting existing server`)
-        await this.adoptExternal(port)
-        return { success: true, url: this.getServerUrl() }
+      if (await isTcpPortOccupied(port)) {
+        const killed = killOrphanDshProcesses(port)
+        if (killed > 0) {
+          // Give the killed processes a moment to release the port
+          await new Promise(r => setTimeout(r, 500))
+        }
+        if (await isTcpPortOccupied(port)) {
+          actualPort = await findFreePort(port + 1)
+          console.warn(`[dsh] port ${port} is held by a foreign process — using sandbox port ${actualPort} instead`)
+        } else {
+          console.log(`[dsh] cleaned ${killed} own orphaned DSH process(es), reusing port ${port}`)
+        }
       }
-    } catch {
-      // probe failed — fall through to normal startup
+    } catch (err) {
+      console.warn('[dsh] port arbitration failed:', err.message)
     }
 
-    // Determine the command to run — prefer the globally-installed DSH CLI
-    // (fast: no npx registry round-trip), falling back to npx when missing.
+    // Determine the command to run — prefer the plugin-managed sandbox DSH
+    // (fast: no npx registry round-trip), falling back to npx (private cache)
+    // when missing. Neither ever touches the user's shared npm caches or
+    // system-global installs.
     const globalDshBin = resolveGlobalDshBin()
     const npxInfo = resolveNpx()
     const nodeInfo = resolveNode()
 
     // Debug: log resolved paths to console for troubleshooting
+    console.log('[dsh] sandbox root:', getSandboxRoot())
     console.log('[dsh] resolveGlobalDshBin:', globalDshBin)
     console.log('[dsh] resolveNpx:', JSON.stringify(npxInfo))
     console.log('[dsh] resolveNode:', JSON.stringify(nodeInfo))
@@ -1255,12 +1800,12 @@ window.dsh.server = {
     }
 
     // Link bridge: the bridge listens on a RANDOM free port and forwards
-    // to the DSH server on the configured port. The iframe connects to the
+    // to the DSH server on the sandbox port. The iframe connects to the
     // bridge URL (getServerUrl) so it receives the injected link
     // interceptor. The bridge is best-effort — if it fails to start, the
     // server still runs (links just won't auto-open in the system browser).
     try {
-      await startBridge(0, port)
+      await startBridge(0, actualPort)
     } catch (err) {
       console.warn('[dsh] link bridge failed to start (non-fatal):', err.message)
     }
@@ -1269,20 +1814,38 @@ window.dsh.server = {
     const cmdArgs = globalDshBin ? [globalDshBin] : [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh']
     if (profile === 'web') {
       cmdArgs.push('web')
+      // DSH web auto-opens the DEFAULT SYSTEM BROWSER at startup
+      // ("dsh web: opening the default browser; pass --no-open to disable").
+      // Without this flag every server start pops an external browser window.
+      cmdArgs.push('--no-open')
+      // A fresh process issues a fresh trust token, so any user-pasted entry
+      // URL for this port (from a previous/external process) is now stale.
+      try {
+        if (typeof utools !== 'undefined' && utools.dbStorage) {
+          utools.dbStorage.removeItem(`dsh-web-entry-${actualPort}`)
+          utools.dbStorage.removeItem(`dsh-web-entry-${port}`)
+        }
+      } catch { /* ignore */ }
     } else {
       cmdArgs.push('--profile', profile)
     }
 
-    // DSH listens on the configured port; the bridge (random port) forwards to it
-    cmdArgs.push('--port', String(port))
+    // DSH listens on the sandbox port; the bridge (random port) forwards to it
+    cmdArgs.push('--port', String(actualPort))
 
     for (const patch of patches) {
       cmdArgs.push('--patch', patch)
     }
 
-    // Environment variables — prepend bundled node dir to PATH
+    // ── Sandbox environment ──
+    // Everything the spawned process touches stays inside the sandbox:
+    //   DSH_HOME=<sandbox>/home          (profiles/sessions/settings)
+    //   npm_config_cache=<sandbox>/cache (npx/npm downloads)
+    // Foreign resources (~/.dsh, ~/.npm) are neither read nor written.
+    ensureSandboxDirs()
     const env = { ...process.env }
     env.DSH_HOME = getDshHome()
+    env.npm_config_cache = getSandboxNpmCache()
     // Use China-friendly registry by default (user can override via .npmrc)
     if (!env.npm_config_registry) {
       env.npm_config_registry = 'https://registry.npmmirror.com'
@@ -1341,32 +1904,41 @@ window.dsh.server = {
 
     serverStatus = {
       running: true,
-      port,
-      dshPort: port,
+      port: actualPort,
+      dshPort: actualPort,
       pid: dshProcess.pid,
       startTime: Date.now(),
       workspace: resolvedWorkspace,
       profile,
     }
+    // Fresh process → any previously captured entry URL is stale
+    dshWebUrl = null
 
-    // Capture stdout for debugging
+    // Capture stdout/stderr for debugging + the tokenized Web UI entry URL.
+    // `dsh web` prints its authenticated entry URL (browser-trust fence) at
+    // startup, e.g. `dsh web: http://127.0.0.1:3080/?...`. Loading the bare
+    // origin gets a 401 "authentication required" page, so the iframe must
+    // load the printed URL instead. Parse it from the process output.
     dshProcess.stdout.on('data', (data) => {
       const text = data.toString()
       stdoutBuffer.push(text)
       if (stdoutBuffer.length > 2000) stdoutBuffer.shift()
+      captureWebUrl(text)
     })
 
-    // Capture stderr for debugging
+    // Capture stderr for debugging (the URL may also land on stderr)
     dshProcess.stderr.on('data', (data) => {
       const text = data.toString()
       stderrBuffer.push(text)
       if (stderrBuffer.length > 2000) stderrBuffer.shift()
+      captureWebUrl(text)
     })
 
     // Handle process exit
     dshProcess.on('exit', (code) => {
       serverStatus.running = false
       serverStatus.pid = null
+      dshWebUrl = null
       stopBridge()
       console.log(`[dsh] server process exited (code=${code})`)
       // Broadcast a custom event so the UI layer can react
@@ -1378,12 +1950,31 @@ window.dsh.server = {
     dshProcess.on('error', (err) => {
       serverStatus.running = false
       serverStatus.pid = null
+      dshWebUrl = null
       console.error('DSH server error:', err.message)
     })
 
-    // Wait for the server to be ready
+    // Wait for the server to be ready, then for the tokenized entry URL
+    // (printed AFTER ready — the race that used to show the 401 page).
     try {
       await this.waitForReady(SERVER_READY_TIMEOUT)
+      if (profile === 'web') {
+        const gotUrl = await this.waitForWebUrl(15000)
+        console.log(gotUrl
+          ? `[dsh] Web UI entry URL ready: ${dshWebUrl}`
+          : '[dsh] no entry URL seen in output — trust guidance will handle it')
+        if (gotUrl) {
+          // Acquire the trust session SERVER-SIDE (SameSite=Strict cookies are
+          // never attached by browsers inside cross-site iframes). Bounded so
+          // a slow server cannot stall start(); the 401-retry in the bridge
+          // proxy re-acquires lazily if this didn't finish in time.
+          const acquired = await Promise.race([
+            bridgeAcquireSession(),
+            new Promise((r) => setTimeout(() => r(null), 6000)),
+          ])
+          console.log(`[dsh] bridge trust session: ${acquired === null ? '(still acquiring — lazy)' : acquired ? 'acquired' : 'not acquired (no token build?)'}`)
+        }
+      }
       return { success: true, url: this.getServerUrl() }
     } catch (err) {
       const stderr = stderrBuffer.join('')
@@ -1502,12 +2093,16 @@ window.dsh.server = {
         timeout: HEALTH_CHECK_TIMEOUT,
       }, (res) => {
         // Any HTTP response means the server is up
-        resolve({ healthy: res.statusCode < 500 })
+        const statusCode = res.statusCode
+        // 401 on the bare origin = DSH ≥0.2.0 browser-trust fence: the
+        // authenticated entry URL (printed as "dsh web: http://...?token=…")
+        // must be used, or the page shows the 401 text instead of the UI.
+        resolve({ healthy: statusCode < 500, trustRequired: statusCode === 401 })
         res.destroy()
       })
 
-      req.on('error', () => resolve({ healthy: false }))
-      req.on('timeout', () => { req.destroy(); resolve({ healthy: false }) })
+      req.on('error', () => resolve({ healthy: false, trustRequired: false }))
+      req.on('timeout', () => { req.destroy(); resolve({ healthy: false, trustRequired: false }) })
     })
   },
 
@@ -1568,6 +2163,31 @@ window.dsh.server = {
   },
 
   /**
+   * Wait for the tokenized Web UI entry URL to appear in the process output.
+   *
+   * WHY: `dsh web` prints its entry URL ("dsh web: http://…?token=…") AFTER
+   * the HTTP server is ready — waitForReady() therefore resolves BEFORE the
+   * URL exists. If start() returned at that instant, the renderer's load()
+   * would read a token-less getWebUrl() and the iframe would render the raw
+   * "dsh web authentication required" 401 page. Waiting here closes the race
+   * for every consumer (WebUI.open, toolbar buttons, MCP tools).
+   *
+   * Non-fatal: if nothing appears within the grace window (unexpected output
+   * shape), return anyway — the trust-guidance panel in web-ui.js covers it.
+   * @param {number} timeout - max wait in ms (default 15s)
+   * @returns {Promise<boolean>} true when an entry URL was captured
+   */
+  async waitForWebUrl(timeout = 15000) {
+    const start = Date.now()
+    while (Date.now() - start < timeout) {
+      if (dshProcess && dshProcess.exitCode !== null) return !!dshWebUrl
+      if (dshWebUrl) return true
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    return !!dshWebUrl
+  },
+
+  /**
    * Get the server URL. If the link bridge is running, returns the
    * bridge URL (which is where the iframe must connect to get the
    * injected link interceptor); otherwise returns the direct DSH URL.
@@ -1588,6 +2208,73 @@ window.dsh.server = {
    */
   getDirectUrl() {
     return `http://127.0.0.1:${serverStatus.port}`
+  },
+
+  /**
+   * Get the authenticated Web UI entry URL. Precedence:
+   *   1. User-pasted entry URL (persisted per port in dbStorage — used when
+   *      adopting an external DSH instance whose stdout we cannot read)
+   *   2. Tokenized URL captured from our own process output (dshWebUrl)
+   *   3. Bare bridge URL (works for DSH versions without the trust fence)
+   * Direct-origin URLs are mapped onto the bridge origin (same path/query)
+   * so the page keeps the injected bridge script.
+   * @returns {string}
+   */
+  getWebUrl() {
+    // 1. Persisted user entry (external/adopted server)
+    let entry = null
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        entry = utools.dbStorage.getItem(`dsh-web-entry-${serverStatus.port}`) || null
+      }
+    } catch { /* ignore */ }
+    // 2. Captured from process output
+    if (!entry) entry = dshWebUrl
+    if (!entry) return this.getServerUrl()
+    const targetOrigin = `http://127.0.0.1:${serverStatus.port}`
+    if (bridgeListenPort && entry.startsWith(targetOrigin)) {
+      return `http://127.0.0.1:${bridgeListenPort}` + entry.slice(targetOrigin.length)
+    }
+    return entry
+  },
+
+  /**
+   * Set (or clear) a user-pasted Web UI entry URL for the current server
+   * port. Used when the running DSH instance is external (adopted) and its
+   * tokenized URL is only visible in whatever terminal started it.
+   * @param {string} url - Full URL, e.g. http://127.0.0.1:3080/?token=xxx
+   * @returns {{ ok: boolean, error?: string }}
+   */
+  setWebEntryUrl(url) {
+    const raw = String(url || '').trim()
+    if (!raw) {
+      try {
+        if (typeof utools !== 'undefined' && utools.dbStorage) {
+          utools.dbStorage.removeItem(`dsh-web-entry-${serverStatus.port}`)
+        }
+      } catch { /* ignore */ }
+      dshWebUrl = null
+      return { ok: true }
+    }
+    // Validate: must be an http URL on a loopback host with the server's port
+    const m = raw.match(/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?([/?#][^\s]*)?$/i)
+    if (!m) return { ok: false, error: 'URL 需形如 http://127.0.0.1:3080/?token=…' }
+    const port = m[2] ? parseInt(m[2].slice(1), 10) : 80
+    if (port !== serverStatus.port) {
+      return { ok: false, error: `端口不匹配：当前服务器端口为 ${serverStatus.port}` }
+    }
+    const normalized = `http://127.0.0.1:${port}${m[3] || '/'}`
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        utools.dbStorage.setItem(`dsh-web-entry-${port}`, normalized)
+      }
+    } catch { /* ignore */ }
+    dshWebUrl = normalized
+    console.log(`[dsh] user-set Web UI entry URL: ${normalized}`)
+    // The pasted token may carry a NEW session — refresh the bridge jar so
+    // forwarded requests are trusted without waiting for a 401-retry.
+    if (bridgeServer) bridgeAcquireSession().catch(() => {})
+    return { ok: true }
   },
 
   /**
@@ -1788,7 +2475,14 @@ window.dsh.config = {
         encoding: 'utf8',
         timeout: 30000,
         cwd: getDshHome(),
-        env: { ...process.env, PATH: path.dirname(nodeInfo.path) + pathSep + systemPath },
+        // Sandbox env: the dumped config must be THIS sandbox's composition,
+        // not the user's ~/.dsh, and npx downloads stay in the private cache.
+        env: {
+          ...process.env,
+          DSH_HOME: getDshHome(),
+          npm_config_cache: getSandboxNpmCache(),
+          PATH: path.dirname(nodeInfo.path) + pathSep + systemPath,
+        },
       }, (err, stdout, stderr) => {
         if (err) {
           reject(new Error(stderr || err.message))
@@ -1841,9 +2535,20 @@ window.dsh.openExternal = function (url) {
 
 ;(function setupIframeLinkInterception() {
   /**
+   * Local DSH-family URL (loopback host, any port)? Those belong to the
+   * DSH server / bridge inside the iframe — they must never pop the
+   * system browser; the iframe's own link handling navigates them.
+   */
+  function isLocalUrl(url) {
+    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?([/?#]|$)/.test(String(url || ''))
+  }
+
+  /**
    * Attach a window-open handler to a webContents.
    * Catches window.open(), target="_blank", and middle-click-new-tab
    * from the DSH iframe (which is cross-origin, so JS injection fails).
+   * Local URLs are denied silently (the iframe navigates itself); only
+   * genuinely external URLs open in the system browser.
    */
   function hookWebContents(wc) {
     if (!wc || wc.__dshHooked) return
@@ -1853,7 +2558,10 @@ window.dsh.openExternal = function (url) {
     if (typeof wc.setWindowOpenHandler === 'function') {
       wc.setWindowOpenHandler(({ url }) => {
         if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) {
-          window.dsh.openExternal(url)
+          if (!isLocalUrl(url)) {
+            window.dsh.openExternal(url)
+          }
+          // Local URLs: deny quietly — the iframe handles its own navigation.
         }
         return { action: 'deny' }
       })
@@ -1865,7 +2573,9 @@ window.dsh.openExternal = function (url) {
       wc.on('new-window', (event, url) => {
         if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) {
           event.preventDefault()
-          window.dsh.openExternal(url)
+          if (!isLocalUrl(url)) {
+            window.dsh.openExternal(url)
+          }
         }
       })
       console.log('[dsh] webContents new-window listener attached')
@@ -2045,6 +2755,9 @@ window.dsh.cli = {
       // Build command — prefer global DSH for speed (no npx round-trip)
       let cmd, cmdArgs, useShell
       const env = { ...process.env }
+      // Sandbox isolation: DSH home + private npm cache (never ~/.dsh / ~/.npm)
+      env.DSH_HOME = getDshHome()
+      env.npm_config_cache = getSandboxNpmCache()
       if (nodeInfo.path) {
         const nodeDir = path.dirname(nodeInfo.path)
         const pathSep = process.platform === 'win32' ? ';' : ':'
@@ -2125,6 +2838,9 @@ window.dsh.cli = {
 
       let cmd, cmdArgs, useShell
       const env = { ...process.env }
+      // Sandbox isolation: DSH home + private npm cache (never ~/.dsh / ~/.npm)
+      env.DSH_HOME = getDshHome()
+      env.npm_config_cache = getSandboxNpmCache()
       if (nodeInfo.path) {
         const nodeDir = path.dirname(nodeInfo.path)
         const pathSep = process.platform === 'win32' ? ';' : ':'
@@ -2227,46 +2943,89 @@ window.dsh.cli = {
 
   /**
    * Install/update DSH via npx.
+   * IMPORTANT: installs GLOBALLY (`npm install -g`) — the server prefers the
+   * global `dsh` binary (resolveGlobalDshBin), so a plain `npx @deepseek-ai/dsh`
+   * would only fill the npx cache and leave a stale global install in place.
+   * That mismatch is exactly how "updated DSH but still runs the old version"
+   * happens, so we update the global install first and only fall back to npx
+   * when the global install fails (e.g. permission-restricted prefixes).
    * @param {{ onOutput?: Function }} callbacks
    * @returns {Promise<boolean>}
    */
   async install(callbacks = {}) {
-    return new Promise((resolve) => {
-      const npxInfo = resolveNpx()
-      const nodeInfo = resolveNode()
-      if (!npxInfo) { resolve(false); return }
-      const env = { ...process.env }
-      if (nodeInfo.path) {
-        const pathSep = process.platform === 'win32' ? ';' : ':'
-        env.PATH = path.dirname(nodeInfo.path) + pathSep + (process.env.PATH || process.env.Path || '')
-      }
-      // Use China-friendly registry by default (user can override via .npmrc)
-      if (!env.npm_config_registry) {
-        env.npm_config_registry = 'https://registry.npmmirror.com'
-      }
-      // Running npx with the package will trigger install
-      const child = spawn(npxInfo.cmd, [...npxInfo.preArgs, '--yes', '@deepseek-ai/dsh', '--version'], {
+    const nodeInfo = resolveNode()
+    if (!nodeInfo.path) { return false }
+
+    const env = { ...process.env }
+    const pathSep = process.platform === 'win32' ? ';' : ':'
+    env.PATH = path.dirname(nodeInfo.path) + pathSep + (process.env.PATH || process.env.Path || '')
+    // Sandbox isolation: installs go into <sandbox>/runtime via --prefix and
+    // downloads cache in <sandbox>/npm-cache — the user's system global npm
+    // tree and ~/.npm cache are never touched.
+    ensureSandboxDirs()
+    env.DSH_HOME = getDshHome()
+    env.npm_config_cache = getSandboxNpmCache()
+    // Use China-friendly registry by default (user can override via .npmrc)
+    if (!env.npm_config_registry) {
+      env.npm_config_registry = 'https://registry.npmmirror.com'
+    }
+
+    // Resolve an npm invocation next to the chosen node (same layout as npx)
+    const nodeBinDir = path.dirname(nodeInfo.path)
+    const parentDir = path.dirname(nodeBinDir)
+    let npmInfo = null
+    const npmCliWin = path.join(parentDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    const npmCliUnix = path.join(parentDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    if (fs.existsSync(npmCliWin)) npmInfo = { cmd: nodeInfo.path, preArgs: [npmCliWin], shell: false }
+    else if (fs.existsSync(npmCliUnix)) npmInfo = { cmd: nodeInfo.path, preArgs: [npmCliUnix], shell: false }
+    else if (hasCommand('npm') || hasCommand('npm.cmd')) {
+      npmInfo = { cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm', preArgs: [], shell: true }
+    }
+
+    const runInstall = (spawnSpec) => new Promise((resolve) => {
+      const child = spawn(spawnSpec.cmd, [...spawnSpec.preArgs, ...spawnSpec.args], {
         cwd: getDshHome(),
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
-        shell: npxInfo.shell,
+        shell: spawnSpec.shell,
       })
-
       let output = ''
       child.stdout.on('data', (data) => {
-        output += data.toString()
-        if (callbacks.onOutput) callbacks.onOutput(data.toString())
+        const text = data.toString()
+        output += text
+        if (callbacks.onOutput) callbacks.onOutput(text)
       })
       child.stderr.on('data', (data) => {
-        output += data.toString()
-        if (callbacks.onOutput) callbacks.onOutput(data.toString())
+        const text = data.toString()
+        output += text
+        if (callbacks.onOutput) callbacks.onOutput(text)
       })
-
-      child.on('exit', (code) => {
-        resolve(code === 0)
-      })
-      child.on('error', () => resolve(false))
+      child.on('exit', (code) => resolve({ ok: code === 0, output }))
+      child.on('error', () => resolve({ ok: false, output }))
     })
+
+    // 1. Preferred: install/update into the plugin-managed sandbox runtime
+    //    (<sandbox>/runtime/node_modules/@deepseek-ai/dsh). This is the copy
+    //    resolveGlobalDshBin() runs — isolated from the user's global npm.
+    if (npmInfo) {
+      const result = await runInstall({
+        cmd: npmInfo.cmd, preArgs: npmInfo.preArgs, shell: npmInfo.shell,
+        args: ['install', '--prefix', getSandboxRuntimeDir(), '@deepseek-ai/dsh'],
+      })
+      if (result.ok) return true
+      if (callbacks.onOutput) {
+        callbacks.onOutput('\n[沙盒安装失败，回退到私有 npx 缓存模式]\n' + result.output.slice(-300))
+      }
+    }
+
+    // 2. Fallback: npx into the PRIVATE cache (sandbox; never ~/.npm)
+    const npxInfo = resolveNpx()
+    if (!npxInfo) return false
+    const result = await runInstall({
+      cmd: npxInfo.cmd, preArgs: npxInfo.preArgs, shell: npxInfo.shell,
+      args: ['--yes', '@deepseek-ai/dsh', '--version'],
+    })
+    return result.ok
   },
 }
 

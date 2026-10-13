@@ -39,6 +39,12 @@ window.App = {
       case 'dsh-headless':
         await this.showHeadless(action)
         break
+      case 'dsh-quick-task':
+        await this.showQuickTask(action)
+        break
+      case 'dsh-file-task':
+        await this.showFileTask(action)
+        break
       case 'dsh-sessions':
         await this.showSessions(action)
         break
@@ -88,22 +94,10 @@ window.App = {
       return
     }
 
-    // Check if a DSH server is already listening (external or from previous session)
-    let existing
-    try {
-      existing = await window.dsh.server.healthCheck()
-    } catch {
-      existing = { healthy: false }
-    }
-
-    if (existing.healthy) {
-      const port = this.getSetting('port', 3080)
-      await window.dsh.server.adoptExternal(port)
-      ServerManager.showServerInfo()
-      this.setExpendHeight(800)
-      WebUI.open()
-      return
-    }
+    // SANDBOX MODE: never adopt foreign DSH servers (VS Code panel, CLI,
+    // leftovers on the configured port). start() cleans OUR OWN orphans
+    // and otherwise picks a free port — external resources stay untouched
+    // and the plugin instance stays fully isolated.
 
     // Show full server manager: env check + config panel
     await ServerManager.checkEnvironment()
@@ -125,6 +119,71 @@ window.App = {
     }
 
     await HeadlessRunner.loadModels()
+    HeadlessRunner.renderHistory()
+  },
+
+  /**
+   * Open the headless view with a prefilled task (and optional workspace).
+   * Used by the matched-cmd entries: 选中文本 (over) / 拖入文件 (files) /
+   * history re-run. Shows the view, fills the form, loads models + history.
+   * @param {string} task
+   * @param {string|null} workspace
+   */
+  async prefillHeadless(task, workspace) {
+    DshUtils.showView('view-headless')
+    this.setExpendHeight(500)
+
+    const taskEl = document.getElementById('headless-task')
+    if (taskEl && task) {
+      taskEl.value = task
+      // Put the caret at the end so the user can append their own ask
+      setTimeout(() => {
+        taskEl.focus()
+        const len = taskEl.value.length
+        taskEl.setSelectionRange(len, len)
+      }, 50)
+    }
+    const wsEl = document.getElementById('headless-workspace')
+    const ws = workspace || window.dsh.workspace.getCurrent()
+    if (wsEl && ws) wsEl.value = ws
+
+    await HeadlessRunner.loadModels()
+    HeadlessRunner.renderHistory()
+  },
+
+  /**
+   * dsh-quick-task — 选中文本交给 DSH 处理（over 匹配指令 / 全局快捷键
+   * autocopy / 功能指令手动进入）。
+   */
+  async showQuickTask(action) {
+    if ((action.type === 'over' || action.type === 'regex') && action.payload) {
+      const text = String(action.payload).trim()
+      await this.prefillHeadless(
+        text + '\n\n（请处理以上内容：分析 / 重构 / 解释 / 翻译…）',
+        null,
+      )
+      return
+    }
+    // 功能指令（"dsh 处理"）— 空表单进入
+    await this.showHeadless(action)
+  },
+
+  /**
+   * dsh-file-task — 拖入/选中文件交给 DSH 分析（files 匹配指令）。
+   */
+  async showFileTask(action) {
+    if (action.type === 'files' && Array.isArray(action.payload) && action.payload.length) {
+      const list = action.payload.map((f) => '- ' + f.path).join('\n')
+      const first = action.payload[0]
+      // Workspace = first file's directory, so relative reads resolve
+      const wsPath = (first.path.replace(/\\/g, '/').match(/^(.*)\/[^/]+$/) || [])[1] || null
+      await this.prefillHeadless(
+        '请分析以下文件（可读取其内容）：\n' + list + '\n\n（补充你的具体要求）',
+        wsPath,
+      )
+      return
+    }
+    await this.showHeadless(action)
   },
 
   async showSessions(action) {
@@ -145,12 +204,81 @@ window.App = {
     await PluginManager.load()
   },
 
+  /**
+   * Plugin center entry — invoked from the WebUI toolbar 🧩 button and the
+   * server-manager panel button. Same view as the "dsh plugins" keyword.
+   */
+  async openPluginCenter() {
+    this.rememberReturnView()
+    await this.showPluginManager({ code: 'dsh-plugin-mgr' })
+  },
+
+  /**
+   * Remember the active view before switching to a secondary view, so the
+   * secondary view's back button returns the user where they came from.
+   */
+  rememberReturnView() {
+    const cur = document.querySelector('.view.active')
+    this._returnView = cur && cur.id ? cur.id : 'view-server-manager'
+  },
+
+  /**
+   * Back from a secondary view (plugin manager / sessions / headless /
+   * settings). Returns to the remembered view, or the server manager when
+   * the secondary view was entered directly via a uTools keyword.
+   */
+  backFromSubView() {
+    const target = this._returnView && document.getElementById(this._returnView)
+      ? this._returnView
+      : 'view-server-manager'
+    const finalTarget = target === 'view-web-ui' && !window.dsh.server.getStatus().running
+      ? 'view-server-manager'
+      : target
+    this._returnView = null
+    this.removeSubInput()
+
+    if (finalTarget === 'view-web-ui') {
+      WebUI.open()
+      return
+    }
+
+    DshUtils.showView(finalTarget)
+    this.setExpendHeight(600)
+    ServerManager.showServerInfo()
+  },
+
+  /**
+   * Back to the server-manager view from the WebUI toolbar.
+   */
+  backToManager() {
+    DshUtils.showView('view-server-manager')
+    this.setExpendHeight(600)
+    ServerManager.showServerInfo()
+  },
+
   async showWorkspace(action) {
-    if (action.type === 'file' && action.payload) {
+    // Official MatchFile payload arrives with type 'files' (plural) — see
+    // api-reference/events.md PluginEnterAction. Accepts the directory drop.
+    if ((action.type === 'files' || action.type === 'file') && action.payload) {
       const files = Array.isArray(action.payload) ? action.payload : [action.payload]
       const dir = files.find((f) => f.isDirectory)
       if (dir) {
         window.dsh.workspace.setCurrent(dir.path)
+        // Directory dropped → make it live immediately: start (sandboxed)
+        // server on it and open the Web UI, instead of just parking the path.
+        const status = window.dsh.server.getStatus()
+        if (!status.running) {
+          const port = this.getSetting('port', 3080)
+          try {
+            await window.dsh.server.start({ workspace: dir.path, port, profile: 'web' })
+          } catch { /* fall through to the manager view */ }
+        }
+        const nowRunning = window.dsh.server.getStatus().running
+        if (nowRunning) {
+          ServerManager.showServerInfo()
+          WebUI.open()
+          return
+        }
       }
     }
 
@@ -196,13 +324,15 @@ window.App = {
   },
 
   setExpendHeight(height) {
-    if (typeof utools !== 'undefined' && utools.setExpendHeight) {
-      if (height === 'max') {
-        utools.setExpendHeight(0)
-      } else {
-        utools.setExpendHeight(height)
-      }
-    }
+    // 官方 API 为 utools.setExpandHeight（uTools 8.0 文档 api-reference/window.md，
+    // 返回 boolean：主窗口场景成功、非主窗口返回 false）；旧版本 uTools 拼作
+    // setExpendHeight。优先调用文档定义的 API，旧版运行环境回退到旧拼写。
+    // height 为 DIP 数值；历史版本曾用 0 表示"最大化"，实测 0 会把窗口塌缩为
+    // 不可见，已移除该特殊值，只接受数字。
+    if (typeof utools === 'undefined') return
+    const fn = utools.setExpandHeight || utools.setExpendHeight
+    if (typeof fn !== 'function') return
+    fn.call(utools, height)
   },
 
   redirect(code, payload) {

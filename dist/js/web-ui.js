@@ -68,26 +68,44 @@ const WebUI = {
 
     DshUtils.showView('view-web-ui')
     // Use a large height — 0 would close the uTools window
-    if (typeof utools !== 'undefined' && utools.setExpendHeight) {
-      utools.setExpendHeight(800)
-    }
+    App.setExpendHeight(800)
     this.load()
   },
 
   /**
    * Load the DSH Web UI in the iframe.
    */
-  load() {
+  async load() {
     this.loadGeneration++
+    const generation = this.loadGeneration
     const iframe = document.getElementById('dsh-iframe')
     const loading = document.getElementById('web-ui-loading')
     const urlDisplay = document.getElementById('web-ui-url-display')
 
     if (!iframe) return
 
-    const url = window.dsh.server.getServerUrl()      // bridge URL (iframe)
+    // Prefer the authenticated entry URL captured from the DSH process
+    // output (browser-trust fence); the bare origin returns 401.
+    const url = (window.dsh.server.getWebUrl && window.dsh.server.getWebUrl()) || window.dsh.server.getServerUrl()
     const directUrl = window.dsh.server.getDirectUrl() // real DSH URL (display)
     urlDisplay.textContent = directUrl || url
+
+    // Trust-fence detection: DSH ≥0.2.0 requires the tokenized entry URL.
+    // When ours carries no token and the bare origin answers 401, loading
+    // the iframe would show the raw "authentication required" text — show
+    // actionable guidance (paste the token URL / restart) instead.
+    if (!/[?&]token=/.test(url)) {
+      try {
+        const hc = await window.dsh.server.healthCheck()
+        if (generation !== this.loadGeneration) return
+        if (hc && hc.trustRequired) {
+          loading.style.display = 'none'
+          this.showTrustGuidance()
+          return
+        }
+      } catch { /* health probe failed — proceed with the normal load */ }
+    }
+    this.hideTrustGuidance()
 
     // Show loading
     loading.style.display = 'flex'
@@ -103,6 +121,7 @@ const WebUI = {
       loading.style.display = 'none'
       iframe.style.display = 'block'
       this.loaded = true
+      this.hideTrustGuidance()
       this.stopReconnect()
       this.injectLinkInterceptor(iframe)
       // Re-trigger preload-level webContents hook for the freshly loaded iframe
@@ -111,22 +130,23 @@ const WebUI = {
       }
     }
 
-    // Fallback: catch full-page navigations to external URLs (cross-origin)
+    // Fallback: if the iframe somehow ended up OFF the bridge URL, reset it
+    // back to the bridge — never auto-open the system browser from an iframe
+    // navigation (that was the "WebUI jumps to external browser" bug).
     iframe.addEventListener('load', () => {
       try {
         const currentUrl = iframe.contentWindow.location.href
         const serverUrl = window.dsh.server.getServerUrl()
         if (currentUrl && !currentUrl.startsWith(serverUrl) && !currentUrl.startsWith('about:')) {
-          WebUI.openExternalUrl(currentUrl)
+          console.warn('[dsh] iframe drifted off the bridge URL, resetting:', currentUrl)
           iframe.src = serverUrl
         }
       } catch (e) {
-        // cross-origin — can't read location, the preload webContents hook handles it
+        // cross-origin — can't read location; nothing to do
       }
     })
 
     // Set a generous timeout — DSH Web UI is a large SPA, first load can be slow
-    const generation = this.loadGeneration
     this.loadTimeout = setTimeout(() => {
       if (this.loaded || generation !== this.loadGeneration) return
       // Don't trust status.running: for adopted external servers there is no
@@ -431,18 +451,140 @@ const WebUI = {
    * Toggle fullscreen (maximize) the Web UI view.
    */
   toggleFullscreen() {
-    if (typeof utools !== 'undefined' && utools.setExpendHeight) {
-      const isMax = this._isMaximized
-      if (isMax) {
-        utools.setExpendHeight(800)
-        this._isMaximized = false
+    const target = this._isMaximized ? 800 : Math.max(window.screen.availHeight || 800, 800)
+    App.setExpendHeight(target)
+    this._isMaximized = !this._isMaximized
+  },
+
+  /**
+   * Handle a client-side error reported by the DSH Web UI (via the link
+   * bridge's window.onerror / unhandledrejection hooks). A React render
+   * crash blanks the page — surface the cause and, when profile plugins
+   * require a newer DSH core than the one running, say so and offer the fix.
+   * @param {string} message
+   * @param {string} source
+   */
+  handleClientError(message, source) {
+    // React retries can spam the same error — collapse repeats within 3s
+    const now = Date.now()
+    if (message === this._lastClientError && now - (this._lastClientErrorTime || 0) < 3000) return
+    this._lastClientError = message
+    this._lastClientErrorTime = now
+    console.error('[dsh] Web UI client error:', message, source)
+
+    // Check installed plugins against the running DSH version
+    let compatLine = ''
+    try {
+      const compat = window.dsh.env.checkPluginCompat()
+      if (compat && compat.incompatible && compat.incompatible.length > 0) {
+        const list = compat.incompatible
+          .slice(0, 5)
+          .map((p) => `${p.name}@${p.version} (需 DSH ≥ ${p.required})`)
+          .join('、')
+        compatLine =
+          `<div class="webui-error-compat">检测到 <b>${compat.incompatible.length}</b> 个插件与当前 DSH ` +
+          `<code>${DshUtils.escapeHtml(compat.dshVersion || '?')}</code> 不兼容：${DshUtils.escapeHtml(list)}。` +
+          `请到 设置 → 环境检测 → 「安装/更新 DSH」升级核心（插件是按较新的 DSH 版本开发的），或卸载这些插件。</div>`
+      }
+    } catch (e) { /* compat check is best-effort */ }
+
+    const banner = document.createElement('div')
+    banner.className = 'webui-error-banner'
+    banner.innerHTML = `
+      <div class="webui-error-title">⚠️ Web UI 渲染出错</div>
+      <div class="webui-error-message">${DshUtils.escapeHtml(message)}</div>
+      ${compatLine}
+      <div class="webui-error-actions">
+        <button class="btn btn-sm btn-secondary" data-act="logs">查看服务器日志</button>
+        <button class="btn btn-sm btn-secondary" data-act="reload">刷新页面</button>
+        <button class="btn btn-sm btn-secondary" data-act="close">关闭</button>
+      </div>
+    `
+    banner.querySelector('[data-act="logs"]').addEventListener('click', () => {
+      const panel = document.getElementById('log-panel')
+      if (panel && panel.style.display !== 'flex') this.toggleLogs()
+    })
+    banner.querySelector('[data-act="reload"]').addEventListener('click', () => {
+      this.removeErrorBanner()
+      this.refresh()
+    })
+    banner.querySelector('[data-act="close"]').addEventListener('click', () => this.removeErrorBanner())
+
+    this.removeErrorBanner()
+    const container = document.querySelector('#view-web-ui .web-ui-container')
+    if (container) container.prepend(banner)
+  },
+
+  /**
+   * Remove the client-error banner, if present.
+   */
+  removeErrorBanner() {
+    const existing = document.querySelector('#view-web-ui .webui-error-banner')
+    if (existing) existing.remove()
+  },
+
+  /**
+   * Show the trust-fence guidance panel. The running DSH instance (usually
+   * an adopted external one whose stdout we cannot read) requires the
+   * tokenized entry URL printed by whoever started it.
+   */
+  showTrustGuidance() {
+    this.hideTrustGuidance()
+    const directUrl = window.dsh.server.getDirectUrl() || 'http://127.0.0.1:3080'
+    const panel = document.createElement('div')
+    panel.className = 'webui-trust-panel'
+    panel.innerHTML = `
+      <div class="webui-trust-title">🔐 此 DSH 实例需要访问令牌</div>
+      <div class="webui-trust-text">
+        当前服务器启用了浏览器信任机制（DSH ≥0.2 的默认行为），直接访问被拒绝 (401)。
+        DSH 在<b>启动它的终端</b>里打印了带 token 的入口地址（例如 VS Code 输出面板），
+        形如 <code>${DshUtils.escapeHtml(directUrl)}/?token=…</code>。把它粘贴到下面即可打开：
+      </div>
+      <div class="webui-trust-form">
+        <input type="text" class="webui-trust-input" id="webui-trust-input"
+               placeholder="${DshUtils.escapeHtml(directUrl)}/?token=…">
+        <button class="btn btn-primary btn-sm" id="webui-trust-open">打开</button>
+        <button class="btn btn-secondary btn-sm" id="webui-trust-retry">重试</button>
+      </div>
+      <div class="webui-trust-hint">
+        💡 也可以关闭该外部实例，回到「服务器管理」点 <b>启动服务器</b> ——
+        由本插件启动时会自动捕获 token，无需手动粘贴。
+      </div>
+      <div class="webui-trust-error hidden" id="webui-trust-error"></div>
+    `
+    const container = document.querySelector('#view-web-ui .web-ui-container')
+    if (!container) return
+    container.prepend(panel)
+
+    const input = panel.querySelector('#webui-trust-input')
+    const errorEl = panel.querySelector('#webui-trust-error')
+    const submit = async () => {
+      const result = window.dsh.server.setWebEntryUrl(input.value)
+      if (result && result.ok) {
+        this.hideTrustGuidance()
+        this.load()
       } else {
-        // Fill the screen with the available window height — 0 would close the
-        // uTools window instead of maximizing it.
-        utools.setExpendHeight(Math.max(window.screen.availHeight || 800, 800))
-        this._isMaximized = true
+        errorEl.textContent = (result && result.error) || '无效的 URL'
+        errorEl.classList.remove('hidden')
       }
     }
+    panel.querySelector('#webui-trust-open').addEventListener('click', submit)
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit() }
+    })
+    panel.querySelector('#webui-trust-retry').addEventListener('click', () => {
+      this.hideTrustGuidance()
+      this.load()
+    })
+    input.focus()
+  },
+
+  /**
+   * Remove the trust guidance panel, if present.
+   */
+  hideTrustGuidance() {
+    const existing = document.querySelector('#view-web-ui .webui-trust-panel')
+    if (existing) existing.remove()
   },
 
   /**
@@ -468,6 +610,10 @@ const WebUI = {
 
       if (data.type === 'dsh-open-external' && data.url) {
         this.openExternalUrl(String(data.url))
+      } else if (data.type === 'dsh-client-error') {
+        // Web UI crashed client-side (React/plugin render failure).
+        // Show an actionable banner instead of a silently blank page.
+        this.handleClientError(String(data.message || ''), String(data.source || ''))
       } else if (data.type === 'dsh-context-link') {
         // Right-click inside the DSH iframe → context menu.
         // With a URL: link actions; without: page-level actions.

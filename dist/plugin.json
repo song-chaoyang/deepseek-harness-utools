@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.1.0",
   "main": "index.html",
   "logo": "logo.png",
   "preload": "preload.js",
@@ -25,13 +25,49 @@
     {
       "code": "dsh-workspace",
       "explain": "选择工作区目录并在 DSH 中打开",
-      "cmds": ["dsh workspace", "DSH 工作区"],
+      "cmds": [
+        "dsh workspace",
+        "DSH 工作区",
+        {
+          "type": "files",
+          "label": "用 DSH 打开此目录",
+          "fileType": "directory",
+          "minLength": 1,
+          "maxLength": 5
+        }
+      ],
       "platform": ["win32", "darwin", "linux"]
     },
     {
       "code": "dsh-goals",
       "explain": "管理会话目标（创建/编辑/暂停/恢复/完成）",
       "cmds": ["dsh goals", "DSH 目标", "dsh goal"]
+    },
+    {
+      "code": "dsh-quick-task",
+      "explain": "把任意选中文本交给 DSH AI 处理（分析、翻译、重构、解释…）",
+      "cmds": [
+        "dsh 处理",
+        {
+          "type": "over",
+          "label": "发给 DSH 处理",
+          "minLength": 2,
+          "maxLength": 8000
+        }
+      ]
+    },
+    {
+      "code": "dsh-file-task",
+      "explain": "把文件交给 DSH AI 分析（代码审查、内容解读、批量处理）",
+      "cmds": [
+        {
+          "type": "files",
+          "label": "让 DSH 分析此文件",
+          "fileType": "file",
+          "minLength": 1,
+          "maxLength": 10
+        }
+      ]
     }
   ],
   "tools": {

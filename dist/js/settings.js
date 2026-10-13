@@ -598,6 +598,18 @@ const Settings = {
     // Server tab
     document.getElementById('btn-save-server-settings')?.addEventListener('click', () => this.saveServerSettings())
 
+    // Global hotkey for "发给 DSH 处理" (over 匹配指令 + autocopy):
+    // after configuration, pressing the hotkey anywhere auto-copies the
+    // current selection and hands it to DSH. Official API:
+    // utools.redirectHotKeySetting(cmdLabel, autocopy) — api-reference/redirect.md
+    document.getElementById('btn-set-hotkey-quick')?.addEventListener('click', () => {
+      if (typeof utools !== 'undefined' && utools.redirectHotKeySetting) {
+        utools.redirectHotKeySetting('发给 DSH 处理', true)
+      } else {
+        DshUtils.notify('当前 uTools 版本不支持该设置')
+      }
+    })
+
     // Env tab
     document.getElementById('btn-recheck-env')?.addEventListener('click', () => this.recheckEnv())
     document.getElementById('btn-install-dsh')?.addEventListener('click', () => this.installDsh())

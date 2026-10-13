@@ -190,6 +190,29 @@ const ServerManager = {
     const dshActions = results.dsh.installed
       ? '<button class="btn btn-secondary btn-sm" onclick="ServerManager.updateDsh()">更新 DSH</button>'
       : '<button class="btn btn-primary btn-sm" onclick="ServerManager.installDsh()">安装 DSH</button>'
+
+    // Plugin ↔ DSH core compatibility (best-effort; filesystem-only check).
+    // Incompatible community plugins crash the Web UI React tree (blank page).
+    let compatRow = ''
+    try {
+      const compat = window.dsh.env.checkPluginCompat()
+      if (compat && compat.incompatible && compat.incompatible.length > 0) {
+        const list = compat.incompatible
+          .slice(0, 3)
+          .map((p) => `${DshUtils.escapeHtml(p.name)}@${p.version} ≥${p.required}`)
+          .join('、')
+        const more = compat.incompatible.length > 3 ? ` 等 ${compat.incompatible.length} 个` : ''
+        compatRow = `
+          <div class="env-check-item">
+            <span class="env-check-icon">⚠️</span>
+            <span class="env-check-name">插件兼容性</span>
+            <span class="env-check-result warning" title="${DshUtils.escapeHtml(compat.incompatible.map((p) => `${p.name}@${p.version} 需 ${p.required}`).join('\n'))}">${DshUtils.escapeHtml(list)}${more} 与 DSH ${DshUtils.escapeHtml(compat.dshVersion || '')} 不兼容</span>
+            <div class="env-check-actions"><button class="btn btn-secondary btn-sm" onclick="ServerManager.updateDsh()">升级 DSH</button></div>
+          </div>
+        `
+      }
+    } catch { /* compat check is best-effort */ }
+
     container.innerHTML = `
       <div class="env-check-item">
         <span class="env-check-icon">${results.nodeOk ? '✅' : '❌'}</span>
@@ -208,6 +231,7 @@ const ServerManager = {
         <span class="env-check-result ${results.dsh.installed ? 'success' : 'warning'}">${results.dsh.installed ? `${results.dsh.version} (${results.dsh.method})` : '未安装'}</span>
         <div class="env-check-actions">${dshActions}</div>
       </div>
+      ${compatRow}
     `
   },
 
@@ -376,7 +400,7 @@ const ServerManager = {
 
         App.addDynamicFeature('dsh-quick-session', '快速打开 DSH 当前会话', ['dsh session', 'DSH 会话'])
 
-        if (typeof utools !== 'undefined' && utools.setExpendHeight) utools.setExpendHeight(800)
+        App.setExpendHeight(800)
         WebUI.open()
       } else {
         this.setStartupStep('spawn', 'failed')

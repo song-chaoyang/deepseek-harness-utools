@@ -129,6 +129,8 @@
 
             <button class="btn btn-secondary" id="btn-restart-server" style="display:none" onclick="ServerManager.restartServer()">🔄 重启</button>
 
+            <button class="btn btn-secondary" id="btn-plugin-center-main" title="安装/管理 DSH 插件" onclick="App.openPluginCenter()">🧩 插件中心</button>
+
           </div>
 
         </div>
@@ -154,10 +156,11 @@
     <div id="view-web-ui" class="view">
       <div class="web-ui-container">
         <div class="web-ui-toolbar">
-          <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面" onclick="DshUtils.showView('view-server-manager'); utools.setExpendHeight(600); ServerManager.showServerInfo()">←</button>
+          <button class="btn btn-icon" id="btn-back-to-manager" title="返回管理界面" onclick="App.backToManager()">←</button>
           <span class="web-ui-url" id="web-ui-url-display">http://127.0.0.1:3080</span>
           <button class="btn btn-icon" id="btn-refresh-webui" title="刷新 (Ctrl+R)" onclick="WebUI.refresh()">↻</button>
           <button class="btn btn-icon" id="btn-show-logs" title="服务器日志 (Ctrl+L)" onclick="WebUI.toggleLogs()">🖥️</button>
+          <button class="btn btn-icon" id="btn-plugin-center" title="插件中心" onclick="App.openPluginCenter()">🧩</button>
           <button class="btn btn-icon" id="btn-open-external" title="在浏览器中打开" onclick="WebUI.openExternal()">↗</button>
         </div>
         <div class="web-ui-loading" id="web-ui-loading">
@@ -172,6 +175,7 @@
     <div id="view-headless" class="view">
       <div class="headless-runner">
         <div class="hr-header">
+          <button class="btn btn-icon" onclick="App.backFromSubView()" title="返回">←</button>
           <h1>Headless 任务</h1>
           <span class="hr-subtitle">输入任务描述，DSH 将自动执行并返回结果</span>
         </div>
@@ -210,12 +214,24 @@
           </div>
           <div class="hr-output-content" id="hr-output-content"></div>
         </div>
+
+        <!-- 最近任务历史 -->
+        <div class="hr-history" id="hr-history" style="display:none">
+          <div class="hr-history-header">
+            <span class="hr-history-title">🕘 最近任务</span>
+            <button class="btn btn-sm btn-secondary" id="btn-clear-headless-history">清空历史</button>
+          </div>
+          <div class="hr-history-list" id="hr-history-list"></div>
+        </div>
       </div>
     </div>
 
     <!-- 设置页面视图 -->
     <div id="view-settings" class="view">
       <div class="settings-page">
+        <div class="settings-back">
+          <button class="btn btn-icon" onclick="App.backFromSubView()" title="返回">←</button>
+        </div>
         <div class="settings-tabs">
           <button class="tab active" data-tab="models">模型配置</button>
           <button class="tab" data-tab="workspace">工作区管理</button>
@@ -315,6 +331,13 @@
                 <span>服务器崩溃后自动重启</span>
               </label>
             </div>
+            <div class="form-row">
+              <label>全局快捷键</label>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <button class="btn btn-secondary" id="btn-set-hotkey-quick">⌨️ 设置"发给 DSH 处理"快捷键</button>
+                <span style="font-size:12px;color:var(--color-text-secondary);">配好后：任意界面选中文本 → 按快捷键 → 自动复制并交给 DSH</span>
+              </div>
+            </div>
             <button class="btn btn-primary" id="btn-save-server-settings">保存</button>
           </div>
 
@@ -366,6 +389,7 @@
     <div id="view-sessions" class="view">
       <div class="session-browser">
         <div class="sb-header">
+          <button class="btn btn-icon" onclick="App.backFromSubView()" title="返回">←</button>
           <h1>会话历史</h1>
           <div class="sb-search">
             <input type="text" id="session-search" placeholder="搜索会话..." class="search-input">
@@ -398,6 +422,7 @@
     <div id="view-plugin-mgr" class="view">
       <div class="plugin-manager">
         <div class="pm-header">
+          <button class="btn btn-icon" onclick="App.backFromSubView()" title="返回">←</button>
           <h1>插件管理</h1>
           <div class="pm-profile-select">
             <label for="pm-profile">Profile:</label>

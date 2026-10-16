@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.0.6",
   "main": "index.html",
   "logo": "logo.png",
   "preload": "preload.js",
@@ -11,6 +11,16 @@
       "code": "dsh-main",
       "explain": "DeepSeek Harness — AI Agent 工作台（启动服务器、打开 Web UI）",
       "cmds": ["DeepSeek Harness", "dsh", "DSH", "deepseek harness", "AI Agent"]
+    },
+    {
+      "code": "dsh-webui",
+      "explain": "启动 DSH 服务器并直接打开 Web UI（可绑定全局快捷键）",
+      "cmds": ["dsh web", "DSH WebUI", "打开 DSH Web UI"]
+    },
+    {
+      "code": "dsh-headless",
+      "explain": "DSH Headless 任务：提交文本任务，无头执行 Agent（带任务历史）",
+      "cmds": ["dsh headless", "dsh task", "DSH 任务", "DSH Headless"]
     },
     {
       "code": "dsh-sessions",
@@ -128,6 +138,60 @@
     },
     "dsh_get_server_status": {
       "description": "获取 DSH 服务器运行状态",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "dsh_stop_server": {
+      "description": "停止 DSH 服务器",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "dsh_restart_server": {
+      "description": "重启 DSH 服务器（保持当前工作区/端口/Profile；未运行时直接启动）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "dsh_create_session": {
+      "description": "创建一个新的 DSH 会话",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "description": "工作区路径（可选，默认当前工作区）"
+          },
+          "model": {
+            "type": "string",
+            "description": "模型（可选）"
+          }
+        }
+      }
+    },
+    "dsh_send_message": {
+      "description": "向 DSH 会话发送消息，让 Agent 处理",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "会话 ID（可通过 dsh_list_sessions 获取）"
+          },
+          "message": {
+            "type": "string",
+            "description": "消息内容"
+          }
+        },
+        "required": ["sessionId", "message"]
+      }
+    },
+    "dsh_update_dsh": {
+      "description": "安装/更新 DSH 核心（首次安装可能需几分钟，完成后重启服务器生效）",
       "inputSchema": {
         "type": "object",
         "properties": {}

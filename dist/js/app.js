@@ -31,10 +31,14 @@ window.App = {
 
     DshUtils.applyTheme()
     this.removeSubInput()
+    SessionWatcher.start()
 
     switch (action.code) {
       case 'dsh-main':
         await this.showMain(action)
+        break
+      case 'dsh-webui':
+        await this.showWebUIEntry(action)
         break
       case 'dsh-headless':
         await this.showHeadless(action)
@@ -99,9 +103,59 @@ window.App = {
     // and otherwise picks a free port — external resources stay untouched
     // and the plugin instance stays fully isolated.
 
+    // Auto-start on plugin entry (设置 → 服务器设置 → "进入插件时自动启动
+    // 服务器"，默认开)：省掉手动点"启动服务器"；失败则回落到配置面板。
+    if (this.getSetting('autoStart', true)) {
+      const port = this.getSetting('port', 3080)
+      const workspace = window.dsh.workspace.getCurrent()
+      DshUtils.setStatusBadge('starting', '自动启动服务器中…')
+      try {
+        const res = await window.dsh.server.start({ workspace, port, profile: 'web' })
+        if (res && res.success === false) throw new Error(res.error)
+        if (window.dsh.server.getStatus().running) {
+          ServerManager.showServerInfo()
+          if (this.getSetting('autoOpenWebUI', true)) {
+            this.setExpendHeight(800)
+            WebUI.open()
+          }
+          return
+        }
+      } catch (err) {
+        console.warn('[dsh] auto-start failed, showing config panel:', err.message)
+      }
+    }
+
     // Show full server manager: env check + config panel
     await ServerManager.checkEnvironment()
     ServerManager.showConfigPanel()
+  },
+
+  /**
+   * dsh-webui — 启动服务器（如未运行）并直接打开 Web UI。
+   * 供全局快捷键（设置 → 服务器设置 → "设置『打开 DSH Web UI』快捷键"）
+   * 与 "dsh web" 功能指令使用。
+   */
+  async showWebUIEntry(action) {
+    const status = window.dsh.server.getStatus()
+    if (!status.running) {
+      const port = this.getSetting('port', 3080)
+      const workspace = window.dsh.workspace.getCurrent()
+      DshUtils.showView('view-server-manager')
+      DshUtils.setStatusBadge('starting', '正在启动服务器…')
+      try {
+        const res = await window.dsh.server.start({ workspace, port, profile: 'web' })
+        if (res && res.success === false) throw new Error(res.error)
+      } catch (err) {
+        console.error('[dsh] dsh-webui start failed:', err.message)
+        DshUtils.setStatusBadge('stopped', '启动失败')
+        await ServerManager.checkEnvironment()
+        ServerManager.showConfigPanel()
+        return
+      }
+    }
+    ServerManager.showServerInfo()
+    this.setExpendHeight(800)
+    WebUI.open()
   },
 
   async showHeadless(action) {
@@ -416,6 +470,7 @@ if (typeof utools !== 'undefined') {
   utools.onPluginOut((isKill) => {
     App.stopUptimeDisplay()
     App.removeSubInput()
+    SessionWatcher.stop()
     // Unload iframe to stop background requests
     WebUI.unload()
     if (isKill) {
@@ -437,8 +492,33 @@ if (typeof utools !== 'undefined') {
       return
     }
 
-    // Unexpected crash — unload and show config panel
     WebUI.unload()
+    const auto = e.detail && e.detail.autoRestart
+
+    // Crash detected — the preload already scheduled an auto-restart
+    // (设置 → 服务器设置 → "服务器崩溃后自动重启"). Show progress and
+    // re-check once the backoff + a start should have completed.
+    if (auto) {
+      const { attempt, max, delay } = auto
+      DshUtils.setStatusBadge('starting', `检测到崩溃，自动重启中 (${attempt}/${max})…`)
+      DshUtils.notify(`DSH 服务器已崩溃，${Math.round(delay / 1000)} 秒后自动重启（第 ${attempt}/${max} 次）`)
+      setTimeout(() => {
+        if (window.dsh.server.getStatus().running) {
+          DshUtils.showView('view-server-manager')
+          ServerManager.showServerInfo()
+          if (App.getSetting('autoOpenWebUI', true)) {
+            App.setExpendHeight(800)
+            WebUI.open()
+          }
+        } else {
+          DshUtils.setStatusBadge('stopped', '已停止')
+          ServerManager.showConfigPanel()
+        }
+      }, delay + 8000)
+      return
+    }
+
+    // Unexpected crash without auto-restart (disabled or retries exhausted)
     DshUtils.showView('view-server-manager')
     DshUtils.setStatusBadge('stopped', '已停止')
     ServerManager.showConfigPanel()

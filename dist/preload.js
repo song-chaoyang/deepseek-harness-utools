@@ -199,6 +199,45 @@ function ensureSandboxDirs() {
 }
 
 /**
+ * Get a polyfill path that the spawned plain-Node process can actually load.
+ *
+ * WHY: published uTools plugins run from inside a .asar archive. Electron's
+ * patched fs "sees" files inside the asar (fs.existsSync is true), so the
+ * naive path.join(__dirname, 'polyfills', ...) check passes — but the
+ * spawned DSH server is a PLAIN Node binary (bundled runtime) with NO asar
+ * support: NODE_OPTIONS=--require=<…>.asar/polyfills/… fails with
+ * "Cannot find module" and kills the process before it can listen. Dev
+ * plugins run from a real directory, where the direct path works.
+ * Fix: when the polyfill lives inside an asar, materialize it (read via the
+ * patched fs, write to the real sandbox directory) and hand back that path.
+ * @returns {string|null} a loadable polyfill path, or null when unavailable
+ */
+function getPolyfillPath() {
+  const src = path.join(__dirname, 'polyfills', 'abort-signal-any.js')
+  try {
+    if (!fs.existsSync(src)) return null
+    // Real directory (dev plugin): use the file in place
+    if (!src.includes('.asar' + path.sep) && !src.endsWith('.asar')) return src
+    // Inside asar (published plugin): copy it onto the real filesystem
+    const destDir = path.join(getSandboxRoot(), 'polyfills')
+    const dest = path.join(destDir, 'abort-signal-any.js')
+    try {
+      fs.mkdirSync(destDir, { recursive: true })
+      const content = fs.readFileSync(src, 'utf8')
+      let needWrite = true
+      try { needWrite = !fs.existsSync(dest) || fs.readFileSync(dest, 'utf8') !== content } catch { needWrite = true }
+      if (needWrite) fs.writeFileSync(dest, content, 'utf8')
+      return dest
+    } catch (copyErr) {
+      console.warn('[dsh] failed to materialize asar polyfill:', copyErr.message)
+      return null
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * Check whether anything is listening on a TCP port (raw connect probe).
  * @param {number} port
  * @returns {Promise<boolean>}
@@ -1727,6 +1766,13 @@ window.dsh.server = {
       || getDshHome()
       || os.homedir()
 
+    // ── Crash auto-restart bookkeeping (consumed by the exit handler below) ──
+    // A manual start() always resets the retry budget; stop() marks the
+    // upcoming exit as intentional so it is never auto-restarted.
+    this._intentionalStop = false
+    this._crashRetries = 0
+    this._lastStartOptions = { workspace: resolvedWorkspace, port, profile, patches }
+
     // If already running, check if same config
     if (dshProcess && serverStatus.running) {
       if (serverStatus.port === port && serverStatus.workspace === resolvedWorkspace) {
@@ -1865,9 +1911,13 @@ window.dsh.server = {
     // implement AbortSignal.any(), which many DSH dependencies rely on, causing
     // "AbortSignal.any is not a function (internal)" when sending messages.
     // NODE_OPTIONS=--require is inherited by both the global-DSH and the npx path.
+    // NOTE: getPolyfillPath() is required here — published plugins run from an
+    // .asar archive, and a --require path inside the asar is unloadable by the
+    // plain-Node child process (it crashes with "Cannot find module"). The
+    // helper materializes the file into the real sandbox dir when needed.
     try {
-      const polyfillPath = path.join(__dirname, 'polyfills', 'abort-signal-any.js')
-      if (fs.existsSync(polyfillPath)) {
+      const polyfillPath = getPolyfillPath()
+      if (polyfillPath) {
         const existing = env.NODE_OPTIONS || ''
         // NODE_OPTIONS is a space-separated token list, so quote the path —
         // otherwise install paths containing spaces (e.g. Windows user
@@ -1941,9 +1991,55 @@ window.dsh.server = {
       dshWebUrl = null
       stopBridge()
       console.log(`[dsh] server process exited (code=${code})`)
+
+      // ── Crash auto-restart ──
+      // Only for UNEXPECTED exits (stop() sets _intentionalStop). Controlled
+      // by the settings toggle "服务器崩溃后自动重启" (dbStorage key
+      // dsh-setting-autoRestart, default on). Up to 3 attempts with
+      // 2s/5s/10s backoff, re-using the original start options. Runs in the
+      // preload (node context) so it also works while the renderer is closed.
+      let autoRestart = null
+      if (this._intentionalStop) {
+        this._intentionalStop = false
+      } else if (this._crashRetries < 3 && this._lastStartOptions) {
+        let enabled = true
+        try {
+          if (typeof utools !== 'undefined' && utools.dbStorage) {
+            const v = utools.dbStorage.getItem('dsh-setting-autoRestart')
+            if (v === 'false' || v === false) enabled = false
+          }
+        } catch { /* default on */ }
+        if (enabled) {
+          this._crashRetries++
+          const attempt = this._crashRetries
+          const delay = [2000, 5000, 10000][attempt - 1]
+          autoRestart = { attempt, max: 3, delay }
+          setTimeout(() => {
+            if (serverStatus.running) return
+            try {
+              const opts = this._lastStartOptions
+              this.start(opts).then((res) => {
+                if (res && res.success === false) {
+                  console.error('[dsh] auto-restart start() failed:', res.error)
+                  try {
+                    window.dispatchEvent(new CustomEvent('dsh-server-exited', {
+                      detail: { code: 'auto-restart-failed', autoRestart: null },
+                    }))
+                  } catch { /* ignore */ }
+                }
+              }).catch((e) => {
+                console.error('[dsh] auto-restart failed:', e.message)
+              })
+            } catch (e) {
+              console.error('[dsh] auto-restart failed:', e.message)
+            }
+          }, delay)
+        }
+      }
+
       // Broadcast a custom event so the UI layer can react
       try {
-        window.dispatchEvent(new CustomEvent('dsh-server-exited', { detail: { code } }))
+        window.dispatchEvent(new CustomEvent('dsh-server-exited', { detail: { code, autoRestart } }))
       } catch { /* not in browser context */ }
     })
 
@@ -2015,6 +2111,9 @@ window.dsh.server = {
    */
   async stop() {
     stopBridge()
+    // Mark the upcoming exit as intentional — the crash auto-restart in the
+    // exit handler must not respawn a user-stopped server.
+    this._intentionalStop = true
     if (!dshProcess) return { success: true }
 
     return new Promise((resolve) => {
@@ -3676,6 +3775,19 @@ window.dsh.utoolsAi = {
 //  Must run at preload init, NOT inside onPluginEnter.
 // ============================================================
 
+// Read the user's configured port from uTools dbStorage (mirrors the
+// renderer's App.getSetting('port', 3080)). Used by MCP tools that run in
+// this preload context without renderer access.
+function readPortSetting() {
+  try {
+    if (typeof utools !== 'undefined' && utools.dbStorage) {
+      const v = utools.dbStorage.getItem('dsh-setting-port')
+      if (v) return parseInt(v, 10) || 3080
+    }
+  } catch { /* ignore */ }
+  return 3080
+}
+
 if (typeof utools !== 'undefined' && utools.registerTool) {
   try {
 
@@ -3740,6 +3852,54 @@ if (typeof utools !== 'undefined' && utools.registerTool) {
       uptime: status.uptime,
       workspace: status.workspace,
     }
+  })
+
+  utools.registerTool('dsh_stop_server', async () => {
+    const status = window.dsh.server.getStatus()
+    if (!status.running) {
+      return { success: true, message: '服务器未运行，无需停止' }
+    }
+    const res = await window.dsh.server.stop()
+    return { success: res.success !== false, message: 'DSH 服务器已停止' }
+  })
+
+  utools.registerTool('dsh_restart_server', async () => {
+    const status = window.dsh.server.getStatus()
+    const workspace = status.workspace || window.dsh.server.getWorkspace()
+    const port = status.port || readPortSetting()
+    const profile = status.profile || 'web'
+    if (status.running) {
+      await window.dsh.server.stop()
+    }
+    const res = await window.dsh.server.start({ workspace, port, profile })
+    if (res && res.success === false) throw new Error(res.error || '重启失败')
+    return { success: true, message: 'DSH 服务器已重启', url: res.url }
+  })
+
+  utools.registerTool('dsh_create_session', async (params) => {
+    const { workspace, model } = params || {}
+    if (!window.dsh.server.getStatus().running) {
+      throw new Error('DSH 服务器未运行，请先启动（dsh_restart_server）')
+    }
+    const session = await window.dsh.api.createSession({ workspace, model })
+    return { success: true, session }
+  })
+
+  utools.registerTool('dsh_send_message', async (params) => {
+    const { sessionId, message } = params
+    if (!sessionId || !message) throw new Error('需要 sessionId 和 message 参数')
+    if (!window.dsh.server.getStatus().running) {
+      throw new Error('DSH 服务器未运行，请先启动（dsh_restart_server）')
+    }
+    const result = await window.dsh.api.sendMessage(sessionId, message)
+    return { success: true, result }
+  })
+
+  utools.registerTool('dsh_update_dsh', async (params, ctx) => {
+    ctx?.sendProgress?.({ progress: 0, total: 1, message: '正在安装/更新 DSH（可能需几分钟）…' })
+    const ok = await window.dsh.cli.install({})
+    if (!ok) throw new Error('DSH 安装/更新失败')
+    return { success: true, message: 'DSH 安装/更新完成，重启服务器后生效' }
   })
 
   } catch (e) {

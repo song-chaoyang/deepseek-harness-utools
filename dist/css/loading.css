@@ -37,6 +37,10 @@
   animation: pulse 2s ease-in-out infinite;
 }
 
+.status-starting {
+  animation: pulse 2s ease-in-out infinite;
+}
+
 /* Progress bar */
 .loading-progress {
   width: 200px;

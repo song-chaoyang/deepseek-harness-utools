@@ -258,6 +258,7 @@ body {
 .status-running { background: var(--color-success); }
 .status-stopped { background: var(--color-danger); }
 .status-unknown { background: var(--color-warning); }
+.status-starting { background: var(--color-warning); }
 
 .env-check-panel,
 .server-config-panel,

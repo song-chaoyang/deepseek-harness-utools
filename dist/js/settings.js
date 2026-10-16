@@ -610,6 +610,17 @@ const Settings = {
       }
     })
 
+    // Global hotkey for "打开 DSH Web UI" (dsh-webui 功能指令 + 快捷键):
+    // after configuration, pressing the hotkey anywhere starts the server
+    // (if needed) and opens the DSH Web UI directly.
+    document.getElementById('btn-set-hotkey-webui')?.addEventListener('click', () => {
+      if (typeof utools !== 'undefined' && utools.redirectHotKeySetting) {
+        utools.redirectHotKeySetting('dsh web', false)
+      } else {
+        DshUtils.notify('当前 uTools 版本不支持该设置')
+      }
+    })
+
     // Env tab
     document.getElementById('btn-recheck-env')?.addEventListener('click', () => this.recheckEnv())
     document.getElementById('btn-install-dsh')?.addEventListener('click', () => this.installDsh())

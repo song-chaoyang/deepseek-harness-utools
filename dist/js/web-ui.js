@@ -40,6 +40,12 @@ const WebUI = {
    */
   unload() {
     this.loadGeneration++
+    if (this._blankHintTimer) {
+      clearTimeout(this._blankHintTimer)
+      this._blankHintTimer = null
+    }
+    const hint = document.getElementById('webui-blank-hint')
+    if (hint) hint.remove()
     const iframe = document.getElementById('dsh-iframe')
     if (iframe) {
       iframe.removeAttribute('src')
@@ -172,6 +178,54 @@ const WebUI = {
 
     // Load the URL
     iframe.src = url
+
+    // Blank-page escape hatch: the DSH shell page fires onload (dark boot
+    // background) BEFORE its SPA boots. If the SPA fails to boot inside the
+    // uTools iframe, the user would stare at a permanent dark blank with no
+    // recourse or clue. After 12s, surface a dismissible bar offering to
+    // open the Web UI in the system browser (verified fully working there).
+    if (this._blankHintTimer) clearTimeout(this._blankHintTimer)
+    this._blankHintTimer = setTimeout(() => {
+      this._blankHintTimer = null
+      if (this.loadGeneration !== generation) return
+      this.showBlankHint(url)
+    }, 12000)
+  },
+
+  /**
+   * Dismissible hint bar shown when the in-app iframe may be stuck on the
+   * DSH boot shell — offers opening the Web UI in the system browser.
+   * @param {string} url - the URL the iframe was loading (bridge origin)
+   */
+  showBlankHint(url) {
+    if (document.getElementById('webui-blank-hint')) return
+    const view = document.getElementById('view-web-ui')
+    if (!view) return
+    const bar = document.createElement('div')
+    bar.id = 'webui-blank-hint'
+    bar.style.cssText = [
+      'display:flex', 'align-items:center', 'gap:10px',
+      'padding:8px 14px', 'font-size:12px',
+      'background:var(--color-warning)', 'color:#000',
+      'position:absolute', 'top:52px', 'left:0', 'right:0', 'z-index:60',
+    ].join(';')
+    const label = document.createElement('span')
+    label.style.cssText = 'flex:1;color:#000'
+    label.textContent = '页面若持续空白，可在系统浏览器中打开 Web UI（功能完整可用）'
+    const openBtn = document.createElement('button')
+    openBtn.className = 'btn btn-sm btn-secondary'
+    openBtn.textContent = '浏览器打开 ↗'
+    openBtn.onclick = () => { bar.remove(); this.openExternalUrl(url) }
+    const closeBtn = document.createElement('button')
+    closeBtn.className = 'btn btn-sm btn-secondary'
+    closeBtn.textContent = '✕'
+    closeBtn.title = '关闭提示'
+    closeBtn.onclick = () => bar.remove()
+    bar.appendChild(label)
+    bar.appendChild(openBtn)
+    bar.appendChild(closeBtn)
+    view.style.position = 'relative'
+    view.appendChild(bar)
   },
 
   /**

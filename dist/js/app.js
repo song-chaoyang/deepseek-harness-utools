@@ -109,6 +109,11 @@ window.App = {
       const port = this.getSetting('port', 3080)
       const workspace = window.dsh.workspace.getCurrent()
       DshUtils.setStatusBadge('starting', '自动启动服务器中…')
+      // Render the manager view (env card + config panel) BEFORE awaiting
+      // start — startup can take tens of seconds and an empty view looks
+      // like a broken/blank plugin.
+      const envReady = ServerManager.checkEnvironment()
+      ServerManager.showConfigPanel()
       try {
         const res = await window.dsh.server.start({ workspace, port, profile: 'web' })
         if (res && res.success === false) throw new Error(res.error)
@@ -121,7 +126,26 @@ window.App = {
           return
         }
       } catch (err) {
-        console.warn('[dsh] auto-start failed, showing config panel:', err.message)
+        console.warn('[dsh] auto-start failed:', err.message)
+        // Bounded recovery: the preload may auto-restart a crashed process,
+        // or a slow process may bind the port after a false-negative start.
+        // Adopt the server when it comes up instead of reporting failure.
+        for (let i = 0; i < 6; i++) {
+          await new Promise((r) => setTimeout(r, 2000))
+          if (window.dsh.server.getStatus().running) {
+            DshUtils.hideError()
+            ServerManager.showServerInfo()
+            if (this.getSetting('autoOpenWebUI', true)) {
+              this.setExpendHeight(800)
+              WebUI.open()
+            }
+            return
+          }
+        }
+        DshUtils.showError('服务器启动失败', err.message || '未知错误')
+        await envReady
+        ServerManager.showConfigPanel()
+        return
       }
     }
 
@@ -142,14 +166,16 @@ window.App = {
       const workspace = window.dsh.workspace.getCurrent()
       DshUtils.showView('view-server-manager')
       DshUtils.setStatusBadge('starting', '正在启动服务器…')
+      // Content while waiting — empty view looks broken during startup
+      ServerManager.checkEnvironment()
+      ServerManager.showConfigPanel()
       try {
         const res = await window.dsh.server.start({ workspace, port, profile: 'web' })
         if (res && res.success === false) throw new Error(res.error)
       } catch (err) {
         console.error('[dsh] dsh-webui start failed:', err.message)
         DshUtils.setStatusBadge('stopped', '启动失败')
-        await ServerManager.checkEnvironment()
-        ServerManager.showConfigPanel()
+        DshUtils.showError('服务器启动失败', err.message || '未知错误')
         return
       }
     }

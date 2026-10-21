@@ -1753,6 +1753,26 @@ window.dsh.server = {
    * @returns {Promise<{ success: boolean, url: string, error?: string }>}
    */
   async start(options = {}) {
+    // Serialize concurrent starts (double onPluginEnter, autoStart + manual
+    // click / hotkey entry, crash-restart overlap). Two parallel start()
+    // calls spawn two DSH processes racing for the same port — the loser
+    // dies with EADDRINUSE ("startup failed: webserver did not activate")
+    // and the UI reports a bogus startup failure. Joining the in-flight
+    // promise makes every caller share one spawn.
+    if (this._startPromise) return this._startPromise
+    this._startPromise = this._doStart(options).finally(() => {
+      this._startPromise = null
+    })
+    return this._startPromise
+  },
+
+  /**
+   * Actual start implementation — always invoked through start() so that
+   * concurrent callers join the same in-flight promise.
+   * @param {{ port?: number, workspace?: string, profile?: string, patches?: string[] }} options
+   * @returns {Promise<{ success: boolean, url: string, error?: string }>}
+   */
+  async _doStart(options = {}) {
     const {
       port = DEFAULT_PORT,
       workspace = null,

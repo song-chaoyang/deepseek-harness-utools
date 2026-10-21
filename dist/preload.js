@@ -292,10 +292,10 @@ function findFreePort(startPort) {
  * and keeps the configured port forever, which then breaks the next start
  * with EADDRINUSE. Only processes whose command line matches BOTH
  *   (a) an @deepseek-ai/dsh entry, and
- *   (b) a path owned by this plugin (uTools bundled runtime, our sandbox,
- *       or our private npm cache)
- * are killed — DSH servers started by the user's terminal, VS Code panel
- * or other shells are never touched.
+ *   (b) OUR sandbox root path (this plugin instance's dsh-sandbox)
+ * are killed — DSH servers started by the user's terminal, VS Code panel,
+ * other shells, or the plugin's OTHER instances (dev vs store) are never
+ * touched.
  * Best-effort: darwin/linux only (lsof); silently no-ops elsewhere.
  * @param {number} port
  * @returns {number} number of processes killed
@@ -314,7 +314,13 @@ function killOrphanDshProcesses(port) {
         cmdline = execSync(`ps -p ${pid} -o command= 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim()
       } catch { continue }
       const isDsh = cmdline.includes('@deepseek-ai/dsh')
-      const isOurs = cmdline.includes('uTools') || cmdline.includes(getSandboxRoot())
+      // Own-sandbox ONLY. Matching any 'uTools' path here made the dev
+      // instance and the store instance kill EACH OTHER's servers (both run
+      // under "Application Support/uTools"), surfacing as random "DSH 已崩溃"
+      // notifications whenever the other instance started. Our spawned DSH
+      // always runs from <sandboxRoot>/..., so requiring the sandbox root
+      // identifies exactly this instance's own orphans.
+      const isOurs = cmdline.includes(getSandboxRoot())
       if (isDsh && isOurs) {
         try {
           process.kill(pid, 'SIGTERM')
@@ -2006,6 +2012,7 @@ window.dsh.server = {
 
     // Handle process exit
     dshProcess.on('exit', (code) => {
+      const wasIntentional = !!this._intentionalStop
       serverStatus.running = false
       serverStatus.pid = null
       dshWebUrl = null
@@ -2055,6 +2062,27 @@ window.dsh.server = {
             }
           }, delay)
         }
+      }
+
+      // Post-mortem: dump the exited process's recent output to the sandbox
+      // so crash causes stay diagnosable after the fact (DSH only writes its
+      // own startup-failure log for some paths; plain exits leave no trace).
+      if (!wasIntentional) {
+        try {
+          const dumpDir = path.join(getSandboxRoot(), 'logs')
+          fs.mkdirSync(dumpDir, { recursive: true })
+          const dump = [
+            `exit at: ${new Date().toISOString()}`,
+            `code: ${code}`,
+            `autoRestart: ${JSON.stringify(autoRestart)}`,
+            `port: ${serverStatus.port}`,
+            '--- stdout (tail) ---',
+            stdoutBuffer.join('').slice(-8000),
+            '--- stderr (tail) ---',
+            stderrBuffer.join('').slice(-8000),
+          ].join('\n')
+          fs.writeFileSync(path.join(dumpDir, `dsh-exit-${Date.now()}.log`), dump, 'utf8')
+        } catch { /* best-effort */ }
       }
 
       // Broadcast a custom event so the UI layer can react

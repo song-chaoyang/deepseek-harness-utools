@@ -228,13 +228,45 @@ const WebUI = {
   bootDiagnosticSummary() {
     const info = this.bootInfo || { stages: [], latest: '' }
     const parts = []
+    // 插件页自身环境（判别安全上下文/混合内容拦截假设的关键证据）
+    parts.push('插件页:' + location.protocol + ' secure=' + window.isSecureContext)
     parts.push('DOM:' + (info.latest || '无采样'))
+    // iframe 同源可达性：null = 跨源或未加载
+    try {
+      const f = document.getElementById('dsh-iframe')
+      const reachable = !!(f && f.contentDocument)
+      parts.push('iframe同源:' + (reachable ? '可访问' : '不可访问(跨源/未加载)'))
+    } catch { parts.push('iframe同源:不可访问(异常)') }
     const errors = info.stages.filter((s) => s.startsWith('resource-error'))
     if (errors.length) parts.push('资源失败:' + errors[errors.length - 1])
     const milestones = info.stages.filter((s) => !s.startsWith('resource-error')).join(' → ')
     if (milestones) parts.push('里程碑:' + milestones)
-    if (!parts.length) parts.push('无遥测(注入脚本未运行)')
     return parts.join(' | ')
+  },
+
+  /**
+   * Open the Web UI in a separate uTools BrowserWindow — a fallback that
+   * does NOT use the in-plugin iframe at all. Works regardless of whatever
+   * page-level difference breaks the iframe in store installs.
+   */
+  openInStandaloneWindow() {
+    const url = (window.dsh.server.getWebUrl && window.dsh.server.getWebUrl())
+      || window.dsh.server.getServerUrl()
+    if (typeof utools !== 'undefined' && utools.createBrowserWindow) {
+      try {
+        utools.createBrowserWindow(url, {
+          width: 1280,
+          height: 860,
+          autoHideMenuBar: true,
+          webPreferences: { contextIsolation: true },
+        })
+        DshUtils.notify('已在独立窗口打开 DSH Web UI')
+        return
+      } catch (err) {
+        console.warn('[dsh] standalone window failed, falling back to browser:', err.message)
+      }
+    }
+    this.openExternalUrl(url)
   },
 
   /**
@@ -261,6 +293,12 @@ const WebUI = {
     openBtn.className = 'btn btn-sm btn-secondary'
     openBtn.textContent = '浏览器打开 ↗'
     openBtn.onclick = () => { bar.remove(); this.openExternalUrl(url) }
+    // In-uTools fallback that bypasses the iframe entirely
+    const winBtn = document.createElement('button')
+    winBtn.className = 'btn btn-sm btn-secondary'
+    winBtn.textContent = '独立窗口打开'
+    winBtn.title = '在 uTools 独立窗口中打开 Web UI（不经过内嵌页面，绕开兼容性问题）'
+    winBtn.onclick = () => { bar.remove(); this.openInStandaloneWindow() }
     // One-click diagnostics: boot telemetry + chain state for issue reports
     const diagBtn = document.createElement('button')
     diagBtn.className = 'btn btn-sm btn-secondary'
@@ -286,6 +324,7 @@ const WebUI = {
     closeBtn.onclick = () => bar.remove()
     bar.appendChild(label)
     bar.appendChild(openBtn)
+    bar.appendChild(winBtn)
     bar.appendChild(diagBtn)
     bar.appendChild(closeBtn)
     view.style.position = 'relative'

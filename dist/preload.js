@@ -1349,7 +1349,7 @@ const LINK_BRIDGE_SCRIPT = `;(function () {
       }, '*')
     } catch (e) {}
   }
-  reportBoot('bridge-installed', document.readyState)
+  reportBoot('bridge-installed', document.readyState + ' secure=' + window.isSecureContext)
   document.addEventListener('DOMContentLoaded', function () { reportBoot('dom-content-loaded') })
   window.addEventListener('load', function () { reportBoot('window-load') })
   // Resource load failures (capture phase — these never reach window.onerror)

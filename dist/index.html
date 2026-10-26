@@ -129,8 +129,18 @@
 
             <button class="btn btn-secondary" id="btn-restart-server" style="display:none" onclick="ServerManager.restartServer()">🔄 重启</button>
 
+            <button class="btn btn-secondary" id="btn-server-logs" style="display:none" onclick="ServerManager.toggleServerLogs()">📋 服务器日志</button>
+
             <button class="btn btn-secondary" id="btn-plugin-center-main" title="安装/管理 DSH 插件" onclick="App.openPluginCenter()">🧩 插件中心</button>
 
+          </div>
+
+          <div id="server-logs-panel" style="display:none;margin-top:12px;">
+            <pre id="server-logs-content" style="max-height:180px;overflow:auto;font-size:11px;line-height:1.5;background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-sm);padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--color-text-secondary);"></pre>
+            <div style="display:flex;gap:8px;margin-top:6px;align-items:center;">
+              <button class="btn btn-secondary btn-sm" onclick="ServerManager.copyServerLogs()">复制日志</button>
+              <span style="font-size:11px;color:var(--color-text-secondary);">token 已自动脱敏</span>
+            </div>
           </div>
 
         </div>
@@ -341,6 +351,14 @@
               </div>
             </div>
             <button class="btn btn-primary" id="btn-save-server-settings">保存</button>
+
+            <div class="form-row" style="margin-top:16px;border-top:1px solid var(--color-border);padding-top:12px;">
+              <span style="font-size:12px;color:var(--color-text-secondary);">备份与恢复：导出/导入工作区列表与插件设置（JSON 文件，不含 API Key）</span>
+              <div style="display:flex;gap:8px;margin-top:8px;">
+                <button class="btn btn-secondary btn-sm" id="btn-export-backup">📤 导出备份</button>
+                <button class="btn btn-secondary btn-sm" id="btn-import-backup">📥 导入备份</button>
+              </div>
+            </div>
           </div>
 
           <!-- 环境检测 Tab -->

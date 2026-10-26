@@ -646,6 +646,81 @@ const Settings = {
         App.setSetting('telemetryDisabled', false)
       }
     })
+
+    // ── Settings backup / restore ──
+    document.getElementById('btn-export-backup')?.addEventListener('click', () => this.exportBackup())
+    document.getElementById('btn-import-backup')?.addEventListener('click', () => this.importBackup())
+  },
+
+  /**
+   * Export settings + workspaces as a JSON file (uTools file save dialog).
+   * Contains NO secrets (API keys live in encrypted storage / DSH creds).
+   */
+  exportBackup() {
+    if (!window.dsh || !window.dsh.workspace || !window.dsh.workspace.exportBackup) {
+      DshUtils.notify('当前版本不支持备份')
+      return
+    }
+    const backup = window.dsh.workspace.exportBackup()
+    if (typeof utools !== 'undefined' && utools.showSaveDialog) {
+      utools.showSaveDialog({
+        title: '导出 DeepSeek Harness 备份',
+        defaultPath: `dsh-backup-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      }, (filePath) => {
+        if (!filePath) return
+        try {
+          require('fs').writeFileSync(filePath, JSON.stringify(backup, null, 2), 'utf8')
+          DshUtils.notify('备份已导出: ' + filePath)
+        } catch (err) {
+          DshUtils.notify('导出失败: ' + err.message)
+        }
+      })
+    } else {
+      // Fallback: copy JSON to clipboard
+      const json = JSON.stringify(backup, null, 2)
+      if (typeof utools !== 'undefined' && utools.copyText) {
+        utools.copyText(json)
+        DshUtils.notify('备份 JSON 已复制到剪贴板（此环境不支持文件保存）')
+      }
+    }
+  },
+
+  /**
+   * Restore settings + workspaces from a JSON backup file (uTools file
+   * picker, falls back to pasting JSON via prompt).
+   */
+  importBackup() {
+    const applyBackup = (jsonText) => {
+      try {
+        const backup = JSON.parse(jsonText)
+        const result = window.dsh.workspace.importBackup(backup)
+        this.loadWorkspaceTab()
+        this.loadServerTab()
+        DshUtils.notify(`已恢复 ${result.settings} 项设置、${result.workspaces} 个工作区`)
+      } catch (err) {
+        DshUtils.notify('恢复失败: ' + (err.message || '无效的备份文件'))
+      }
+    }
+
+    if (typeof utools !== 'undefined' && utools.showOpenDialog) {
+      utools.showOpenDialog({
+        title: '导入 DeepSeek Harness 备份',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        properties: ['openFile'],
+      }, (files) => {
+        if (!files || !files[0]) return
+        try {
+          const jsonText = require('fs').readFileSync(files[0], 'utf8')
+          applyBackup(jsonText)
+        } catch (err) {
+          DshUtils.notify('读取失败: ' + err.message)
+        }
+      })
+    } else {
+      const text = prompt('粘贴备份 JSON:')
+      if (text) applyBackup(text)
+    }
   },
 
   // ============================================================

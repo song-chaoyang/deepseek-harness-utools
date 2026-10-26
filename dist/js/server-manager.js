@@ -185,6 +185,7 @@ const ServerManager = {
   showEnvResults(results) {
     const container = document.getElementById('env-check-list-settings')
     if (!container) return
+    this.checkDshVersion()
     const nodeActions = results.nodeOk ? '' :
       `<button class="btn btn-primary btn-sm" onclick="ServerManager.autoInstallRuntime()">🔧 自动安装</button>`
     const dshActions = results.dsh.installed
@@ -253,6 +254,97 @@ const ServerManager = {
   },
 
   async updateDsh() { return this.installDsh() },
+
+  // ============================================================
+  //  Server log viewer (stdout/stderr tails, token-masked)
+  // ============================================================
+
+  _logsTimer: null,
+
+  toggleServerLogs() {
+    const panel = document.getElementById('server-logs-panel')
+    if (!panel) return
+    const show = panel.style.display === 'none'
+    panel.style.display = show ? 'block' : 'none'
+    if (show) {
+      this.refreshServerLogs()
+      // Light auto-refresh while the panel is open
+      this._logsTimer = setInterval(() => this.refreshServerLogs(), 3000)
+    } else if (this._logsTimer) {
+      clearInterval(this._logsTimer)
+      this._logsTimer = null
+    }
+  },
+
+  refreshServerLogs() {
+    const el = document.getElementById('server-logs-content')
+    if (!el || !window.dsh || !window.dsh.server.getServerLogs) return
+    const logs = window.dsh.server.getServerLogs()
+    const text = [logs.stdout, logs.stderr].filter(Boolean).join('\n--- stderr ---\n')
+    const tail = text.length > 12000 ? '…(更早日志已截断)\n' + text.slice(-12000) : text
+    el.textContent = tail || '(暂无输出)'
+    // Keep the latest output in view unless the user is selecting text
+    if (!window.getSelection().toString()) el.scrollTop = el.scrollHeight
+  },
+
+  copyServerLogs() {
+    const el = document.getElementById('server-logs-content')
+    if (!el) return
+    const text = el.textContent || ''
+    if (typeof utools !== 'undefined' && utools.copyText) {
+      utools.copyText(text)
+      DshUtils.notify('日志已复制')
+    } else {
+      navigator.clipboard?.writeText(text).then(() => DshUtils.notify('日志已复制'), () => {})
+    }
+  },
+
+  // ============================================================
+  //  DSH version check + one-click upgrade
+  // ============================================================
+
+  async checkDshVersion() {
+    const results = window.dsh.env.checkPrerequisites()
+    const installed = window.dsh.cli.getInstalledVersion
+      ? window.dsh.cli.getInstalledVersion()
+      : (results.dsh && results.dsh.version) || null
+    let latest = null
+    try {
+      latest = await window.dsh.cli.getLatestVersion()
+    } catch { /* registry unreachable — just show installed */ }
+
+    const row = document.createElement('div')
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--color-border);font-size:12px;flex-wrap:wrap;'
+    if (!installed) {
+      row.innerHTML = '<span>📦 DSH 版本：未安装</span>'
+    } else if (latest && window.dsh.cli.compareVersions(latest, installed) > 0) {
+      row.innerHTML = `<span>📦 DSH 版本：<b>${DshUtils.escapeHtml(installed)}</b> → 最新 <b style="color:var(--color-warning)">${DshUtils.escapeHtml(latest)}</b></span>`
+      const btn = document.createElement('button')
+      btn.className = 'btn btn-primary btn-sm'
+      btn.textContent = '⬆️ 一键升级'
+      btn.onclick = async () => {
+        btn.disabled = true
+        btn.textContent = '升级中…'
+        DshUtils.notify('正在升级 DSH（可能需几分钟）…')
+        const ok = await window.dsh.cli.install({})
+        btn.disabled = false
+        btn.textContent = '⬆️ 一键升级'
+        if (ok) {
+          DshUtils.notify(`DSH 已升级到 ${latest}，重启服务器后生效`)
+          this.checkDshVersion()
+        } else {
+          DshUtils.notify('DSH 升级失败，请查看服务器日志')
+        }
+      }
+      row.appendChild(btn)
+    } else {
+      row.innerHTML = `<span>📦 DSH 版本：<b>${DshUtils.escapeHtml(installed)}</b>${latest ? '（已是最新）' : ''}</span>`
+    }
+    const container = document.getElementById('env-check-list-settings')
+    if (container) {
+      container.appendChild(row)
+    }
+  },
 
   /**
    * Show the server configuration panel.

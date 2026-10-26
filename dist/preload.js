@@ -2274,6 +2274,20 @@ window.dsh.server = {
   },
 
   /**
+   * Recent server output (stdout + stderr tails), for the in-plugin log
+   * viewer. Tokens in captured entry URLs are masked before display.
+   * @returns {{ stdout: string, stderr: string, running: boolean }}
+   */
+  getServerLogs() {
+    const mask = (s) => String(s).replace(/(token=)[A-Za-z0-9_-]+/g, '$1***')
+    return {
+      stdout: mask(stdoutBuffer.join('')),
+      stderr: mask(stderrBuffer.join('')),
+      running: !!serverStatus.running,
+    }
+  },
+
+  /**
    * Health check — probe the DSH server.
    * @returns {Promise<{ healthy: boolean }>}
    */
@@ -2891,6 +2905,78 @@ window.dsh.workspace = {
   },
 
   /**
+   * Export all settings + workspaces as a backup payload (for the settings
+   * backup/restore feature). Includes every dsh-setting-* key and the
+   * workspace list.
+   * @returns {object}
+   */
+  exportBackup() {
+    const settings = {}
+    try {
+      if (typeof utools !== 'undefined' && utools.dbStorage) {
+        // dbStorage has no key enumeration; the known setting keys are a
+        // small closed set owned by this plugin — list them explicitly.
+        const KEYS = ['port', 'autoStart', 'autoOpenWebUI', 'backgroundRun', 'autoRestart', 'telemetryDisabled']
+        for (const k of KEYS) {
+          const v = utools.dbStorage.getItem(`dsh-setting-${k}`)
+          if (v !== null && v !== undefined) settings[k] = v
+        }
+      }
+    } catch { /* ignore */ }
+    return {
+      format: 'deepseek-harness-backup',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings,
+      workspaces: this.list(),
+      currentWorkspace: this.getCurrent(),
+    }
+  },
+
+  /**
+   * Restore settings + workspaces from a backup payload (see exportBackup).
+   * Workspaces are merged (path-unique, existing lastUsed preserved); only
+   * known setting keys are accepted.
+   * @param {object} backup
+   * @returns {{ settings: number, workspaces: number }}
+   */
+  importBackup(backup) {
+    if (!backup || backup.format !== 'deepseek-harness-backup') {
+      throw new Error('不是有效的 DeepSeek Harness 备份文件')
+    }
+    const KNOWN = ['port', 'autoStart', 'autoOpenWebUI', 'backgroundRun', 'autoRestart', 'telemetryDisabled']
+    let nSettings = 0
+    try {
+      if (backup.settings && typeof backup.settings === 'object' && typeof utools !== 'undefined' && utools.dbStorage) {
+        for (const k of KNOWN) {
+          if (backup.settings[k] !== undefined) {
+            utools.dbStorage.setItem(`dsh-setting-${k}`, backup.settings[k])
+            nSettings++
+          }
+        }
+      }
+    } catch { /* ignore */ }
+    let nWorkspaces = 0
+    try {
+      if (Array.isArray(backup.workspaces)) {
+        const existing = this.list()
+        const paths = new Set(existing.map((w) => w.path))
+        for (const w of backup.workspaces) {
+          if (w && typeof w.path === 'string' && w.path && !paths.has(w.path)) {
+            existing.push({ path: w.path, name: w.name || path.basename(w.path), lastUsed: w.lastUsed || 0 })
+            paths.add(w.path)
+            nWorkspaces++
+          }
+        }
+        if (typeof utools !== 'undefined' && utools.dbStorage) {
+          utools.dbStorage.setItem('dsh-workspaces', existing)
+        }
+      }
+    } catch { /* ignore */ }
+    return { settings: nSettings, workspaces: nWorkspaces }
+  },
+
+  /**
    * Get the current/last-used workspace.
    * @returns {string|null}
    */
@@ -3132,6 +3218,66 @@ window.dsh.cli = {
    */
   isInstalled() {
     return window.dsh.env.hasDshInstalled({ skipNpx: true }).installed
+  },
+
+  /**
+   * Get the sandbox DSH version (fast — reads the installed package.json,
+   * no process spawn).
+   * @returns {string|null}
+   */
+  getInstalledVersion() {
+    try {
+      const pkg = path.join(getSandboxRuntimeDir(), 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+      if (fs.existsSync(pkg)) return JSON.parse(fs.readFileSync(pkg, 'utf8')).version || null
+    } catch { /* fall through */ }
+    return null
+  },
+
+  /**
+   * Latest DSH version on the registry (npm view, China mirror default).
+   * @returns {Promise<string|null>}
+   */
+  async getLatestVersion() {
+    const nodeInfo = resolveNode()
+    if (!nodeInfo.path) return null
+    const nodeBinDir = path.dirname(nodeInfo.path)
+    const parentDir = path.dirname(nodeBinDir)
+    const env = { ...process.env }
+    env.npm_config_cache = getSandboxNpmCache()
+    if (!env.npm_config_registry) env.npm_config_registry = 'https://registry.npmmirror.com'
+    let npmInfo = null
+    const npmCliWin = path.join(parentDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    const npmCliUnix = path.join(parentDir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    if (fs.existsSync(npmCliWin)) npmInfo = { cmd: nodeInfo.path, preArgs: [npmCliWin] }
+    else if (fs.existsSync(npmCliUnix)) npmInfo = { cmd: nodeInfo.path, preArgs: [npmCliUnix] }
+    else return null
+    try {
+      const out = execSync(`"${npmInfo.cmd}" ${npmInfo.preArgs.join(' ')} view @deepseek-ai/dsh version`.replace('"" ', '" "'), {
+        encoding: 'utf8', timeout: 20000, env, stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      const v = String(out).trim()
+      return v && /^\d/.test(v) ? v : null
+    } catch {
+      return null
+    }
+  },
+
+  /**
+   * Compare two semver strings (prerelease-aware for 0.x-rc versions).
+   * @returns {number} 1 if a > b, -1 if a < b, 0 if equal
+   */
+  compareVersions(a, b) {
+    const parse = (v) => String(v || '').split('-')[0].split('.').map((n) => parseInt(n, 10) || 0)
+    const pa = parse(a)
+    const pb = parse(b)
+    for (let i = 0; i < 3; i++) {
+      if ((pa[i] || 0) !== (pb[i] || 0)) return pa[i] > pb[i] ? 1 : -1
+    }
+    // Same numeric core: prerelease (0.2.0-rc.2) < release (0.2.0)
+    const preA = String(a || '').includes('-')
+    const preB = String(b || '').includes('-')
+    if (preA !== preB) return preA ? -1 : 1
+    return 0
   },
 
   /**

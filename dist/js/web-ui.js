@@ -63,6 +63,11 @@ const WebUI = {
    * Open the Web UI view.
    */
   open() {
+    // Fresh boot telemetry per open (populated via dsh-boot-progress
+    // messages from the injected bridge script; surfaced in the blank hint).
+    this.bootInfo = { stages: [], latest: '' }
+    const staleHint = document.getElementById('webui-blank-hint')
+    if (staleHint) staleHint.remove()
     const status = window.dsh.server.getStatus()
     if (!status.running) {
       // Server not running — show config panel so user can start it
@@ -193,6 +198,46 @@ const WebUI = {
   },
 
   /**
+   * Record a boot-telemetry event from the injected bridge script.
+   * Keeps the last few milestones plus the latest DOM sample; surfaced in
+   * the blank hint so a stuck boot is diagnosable without devtools.
+   * @param {string} stage
+   * @param {string} detail
+   */
+  recordBootProgress(stage, detail) {
+    if (!this.bootInfo) this.bootInfo = { stages: [], latest: '' }
+    if (stage === 'dom-sample') {
+      this.bootInfo.latest = detail
+      return
+    }
+    if (stage === 'spa-booted') {
+      this.bootInfo.booted = true
+      // App mounted — the blank hint is moot now
+      const hint = document.getElementById('webui-blank-hint')
+      if (hint) hint.remove()
+    }
+    const line = stage + (detail ? ' — ' + detail : '')
+    this.bootInfo.stages.push(line)
+    if (this.bootInfo.stages.length > 12) this.bootInfo.stages.shift()
+  },
+
+  /**
+   * Human-readable one-line diagnostic summary of the iframe boot state.
+   * @returns {string}
+   */
+  bootDiagnosticSummary() {
+    const info = this.bootInfo || { stages: [], latest: '' }
+    const parts = []
+    parts.push('DOM:' + (info.latest || '无采样'))
+    const errors = info.stages.filter((s) => s.startsWith('resource-error'))
+    if (errors.length) parts.push('资源失败:' + errors[errors.length - 1])
+    const milestones = info.stages.filter((s) => !s.startsWith('resource-error')).join(' → ')
+    if (milestones) parts.push('里程碑:' + milestones)
+    if (!parts.length) parts.push('无遥测(注入脚本未运行)')
+    return parts.join(' | ')
+  },
+
+  /**
    * Dismissible hint bar shown when the in-app iframe may be stuck on the
    * DSH boot shell — offers opening the Web UI in the system browser.
    * @param {string} url - the URL the iframe was loading (bridge origin)
@@ -204,18 +249,36 @@ const WebUI = {
     const bar = document.createElement('div')
     bar.id = 'webui-blank-hint'
     bar.style.cssText = [
-      'display:flex', 'align-items:center', 'gap:10px',
+      'display:flex', 'align-items:center', 'gap:10px', 'flex-wrap:wrap',
       'padding:8px 14px', 'font-size:12px',
       'background:var(--color-warning)', 'color:#000',
       'position:absolute', 'top:52px', 'left:0', 'right:0', 'z-index:60',
     ].join(';')
     const label = document.createElement('span')
-    label.style.cssText = 'flex:1;color:#000'
+    label.style.cssText = 'flex:1;min-width:220px;color:#000'
     label.textContent = '页面若持续空白，可在系统浏览器中打开 Web UI（功能完整可用）'
     const openBtn = document.createElement('button')
     openBtn.className = 'btn btn-sm btn-secondary'
     openBtn.textContent = '浏览器打开 ↗'
     openBtn.onclick = () => { bar.remove(); this.openExternalUrl(url) }
+    // One-click diagnostics: boot telemetry + chain state for issue reports
+    const diagBtn = document.createElement('button')
+    diagBtn.className = 'btn btn-sm btn-secondary'
+    diagBtn.textContent = '复制诊断'
+    diagBtn.title = '复制页面启动诊断信息，粘贴给开发者即可定位问题'
+    diagBtn.onclick = () => {
+      const status = window.dsh.server.getStatus()
+      const text = [
+        'DeepSeekHarness WebUI 诊断',
+        '时间: ' + new Date().toISOString(),
+        '插件版本: ' + (typeof utools !== 'undefined' && utools.getUtoolsApiVersion ? '(见关于)' : ''),
+        '服务器: running=' + status.running + ' port=' + status.port + ' pid=' + status.pid,
+        'iframe启动: ' + this.bootDiagnosticSummary(),
+      ].join('\n')
+      const done = () => DshUtils.notify('诊断信息已复制')
+      if (typeof utools !== 'undefined' && utools.copyText) utools.copyText(text), done()
+      else if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => {})
+    }
     const closeBtn = document.createElement('button')
     closeBtn.className = 'btn btn-sm btn-secondary'
     closeBtn.textContent = '✕'
@@ -223,6 +286,7 @@ const WebUI = {
     closeBtn.onclick = () => bar.remove()
     bar.appendChild(label)
     bar.appendChild(openBtn)
+    bar.appendChild(diagBtn)
     bar.appendChild(closeBtn)
     view.style.position = 'relative'
     view.appendChild(bar)
@@ -668,6 +732,10 @@ const WebUI = {
         // Web UI crashed client-side (React/plugin render failure).
         // Show an actionable banner instead of a silently blank page.
         this.handleClientError(String(data.message || ''), String(data.source || ''))
+      } else if (data.type === 'dsh-boot-progress') {
+        // Boot telemetry from the injected bridge script (milestones,
+        // resource failures, DOM growth samples).
+        this.recordBootProgress(String(data.stage || ''), String(data.detail || ''))
       } else if (data.type === 'dsh-context-link') {
         // Right-click inside the DSH iframe → context menu.
         // With a URL: link actions; without: page-level actions.

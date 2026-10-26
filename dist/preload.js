@@ -1334,6 +1334,47 @@ const LINK_BRIDGE_SCRIPT = `;(function () {
     var msg = r && (r.message || r)
     if (msg) reportClientError('Unhandled rejection: ' + msg, r && r.stack ? String(r.stack).split('\\n')[0] : '')
   }, true)
+
+  // ── Boot telemetry ──
+  // In the uTools production iframe there is no devtools: when the SPA
+  // silently fails to boot (dark blank shell), report WHY to the parent —
+  // milestones, every failed resource (script/css/img), and DOM growth
+  // samples so the parent can tell "boot shell only" from a mounted app.
+  function reportBoot(stage, detail) {
+    try {
+      window.parent.postMessage({
+        type: 'dsh-boot-progress',
+        stage: String(stage).slice(0, 60),
+        detail: String(detail || '').slice(0, 400),
+      }, '*')
+    } catch (e) {}
+  }
+  reportBoot('bridge-installed', document.readyState)
+  document.addEventListener('DOMContentLoaded', function () { reportBoot('dom-content-loaded') })
+  window.addEventListener('load', function () { reportBoot('window-load') })
+  // Resource load failures (capture phase — these never reach window.onerror)
+  window.addEventListener('error', function (e) {
+    var t = e && e.target
+    if (t && t.tagName && (t.src || t.href)) {
+      reportBoot('resource-error', t.tagName + ' ' + String(t.src || t.href).slice(0, 300))
+    }
+  }, true)
+  // DOM growth sampling: the boot shell has only a handful of elements;
+  // a mounted SPA has hundreds. >30 total elements = booted.
+  var bootSamples = 0
+  var bootTimer = setInterval(function () {
+    bootSamples++
+    try {
+      var total = document.body ? document.body.querySelectorAll('*').length : 0
+      reportBoot('dom-sample', 'total=' + total)
+      if (total > 30) {
+        clearInterval(bootTimer)
+        reportBoot('spa-booted', 'total=' + total)
+        return
+      }
+    } catch (e) {}
+    if (bootSamples >= 30) clearInterval(bootTimer)
+  }, 1000)
 })()`
 
 /**
@@ -1507,7 +1548,12 @@ function bridgeProxyRequest(req, res, retried = false) {
         const tag = '<script src="/__dsh_link_bridge.js"></script>'
         // Strip any CSP meta tags so the injected script is allowed to run
         html = html.replace(/<meta[^>]*http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi, '')
-        if (/<\/head>/i.test(html)) {
+        if (/<head[^>]*>/i.test(html)) {
+          // Inject as the FIRST thing inside <head> so our error/telemetry
+          // listeners install before the shell's own boot scripts — errors
+          // thrown by those scripts must be captured too.
+          html = html.replace(/<head[^>]*>/i, (m) => m + tag)
+        } else if (/<\/head>/i.test(html)) {
           html = html.replace(/<\/head>/i, tag + '</head>')
         } else if (/<body[^>]*>/i.test(html)) {
           html = html.replace(/<body[^>]*>/i, (m) => m + tag)

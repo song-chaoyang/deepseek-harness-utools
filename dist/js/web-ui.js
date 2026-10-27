@@ -77,6 +77,20 @@ const WebUI = {
       return
     }
 
+    // Display mode (设置 → 服务器设置): 'window' = standalone uTools window
+    // (default — the in-plugin iframe is silently blocked by the store
+    // plugin page's file:// secure context, confirmed via field diagnostics
+    // 2026-10-27), 'iframe' = legacy embedded view.
+    const mode = (typeof App !== 'undefined' && App.getSetting)
+      ? App.getSetting('webuiDisplayMode', 'window')
+      : 'window'
+    if (mode === 'window') {
+      this.openInStandaloneWindow()
+      DshUtils.showView('view-server-manager')
+      ServerManager.showServerInfo()
+      return
+    }
+
     DshUtils.showView('view-web-ui')
     // Use a large height — 0 would close the uTools window
     App.setExpendHeight(800)
@@ -182,6 +196,7 @@ const WebUI = {
     }, 15000)
 
     // Load the URL
+    this.lastLoadUrl = url
     iframe.src = url
 
     // Blank-page escape hatch: the DSH shell page fires onload (dark boot
@@ -230,6 +245,7 @@ const WebUI = {
     const parts = []
     // 插件页自身环境（判别安全上下文/混合内容拦截假设的关键证据）
     parts.push('插件页:' + location.protocol + ' secure=' + window.isSecureContext)
+    parts.push('尝试加载:' + (this.lastLoadUrl || '无'))
     parts.push('DOM:' + (info.latest || '无采样'))
     // iframe 同源可达性：null = 跨源或未加载
     try {

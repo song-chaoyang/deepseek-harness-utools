@@ -452,6 +452,8 @@ const Settings = {
     document.getElementById('setting-auto-start').checked = App.getSetting('autoStart', true)
     document.getElementById('setting-background').checked = App.getSetting('backgroundRun', false)
     document.getElementById('setting-auto-restart').checked = App.getSetting('autoRestart', true)
+    const embedToggle = document.getElementById('setting-webui-embed')
+    if (embedToggle) embedToggle.checked = App.getSetting('webuiDisplayMode', 'window') === 'iframe'
   },
 
   /**
@@ -462,6 +464,10 @@ const Settings = {
     App.setSetting('autoStart', document.getElementById('setting-auto-start').checked)
     App.setSetting('backgroundRun', document.getElementById('setting-background').checked)
     App.setSetting('autoRestart', document.getElementById('setting-auto-restart').checked)
+    const embedToggle = document.getElementById('setting-webui-embed')
+    if (embedToggle) {
+      App.setSetting('webuiDisplayMode', embedToggle.checked ? 'iframe' : 'window')
+    }
     DshUtils.notify('服务器设置已保存')
   },
 
